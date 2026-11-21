@@ -85,6 +85,11 @@ pub fn roleKey(allocator: std.mem.Allocator, scope: []const u8, role_definition_
     return std.ascii.lowerString(joined, joined);
 }
 
+pub fn sameRole(a: Row, b: Row) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trimEnd(u8, a.eligibility.scope, "/"), std.mem.trimEnd(u8, b.eligibility.scope, "/")) and
+        std.ascii.eqlIgnoreCase(scope_mod.lastSegment(a.eligibility.role_definition_id), scope_mod.lastSegment(b.eligibility.role_definition_id));
+}
+
 fn laterEnd(a: ?i64, b: ?i64) ?i64 {
     const x = a orelse return null;
     const y = b orelse return null;

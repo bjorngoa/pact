@@ -190,7 +190,7 @@ pub const Model = struct {
     /// Whether the running operation changes `row`.
     pub fn isWorking(m: *const Model, row: Row) bool {
         for (m.working) |w| {
-            if (std.mem.eql(u8, w.eligibility.schedule_id, row.eligibility.schedule_id)) return true;
+            if (rows_mod.sameRole(w, row)) return true;
         }
         return false;
     }
@@ -271,10 +271,21 @@ pub const Model = struct {
         m.busy_since = started_at;
     }
 
+    /// Reconcile independent workers without dismissing a form being edited.
+    pub fn setRunning(m: *Model, label: []const u8, targets: []const Row, started_at: i64) Allocator.Error!void {
+        const working = try m.gpa.dupe(Row, targets);
+        m.gpa.free(m.working);
+        m.working = working;
+        m.busy = if (working.len > 0) label else null;
+        m.busy_since = started_at;
+        if (working.len == 0 and m.mode == .progress) m.mode = .browse;
+    }
+
     pub fn rememberRetry(m: *Model, targets: []const Row, intent: selection.Intent, duration_min: u32) Allocator.Error!void {
         if (!m.sign_in_enabled) return;
         m.clearSelection();
         for (targets) |target| {
+            if (m.selected.contains(target.eligibility.schedule_id)) continue;
             const id = try m.gpa.dupe(u8, target.eligibility.schedule_id);
             errdefer m.gpa.free(id);
             try m.selected.put(m.gpa, id, {});
@@ -482,10 +493,10 @@ pub const Model = struct {
     }
 
     fn beginActivate(m: *Model) Allocator.Error!Effect {
-        if (m.busy != null) return m.showBusy();
         const targets = try m.collectTargets(.eligible);
         if (targets.len == 0) {
             m.gpa.free(targets);
+            if (m.busy != null) return m.showBusy();
             m.setNotice(.info, "Nothing to activate: choose an eligible role (○).");
             return .none;
         }
@@ -501,10 +512,10 @@ pub const Model = struct {
     }
 
     fn beginDeactivate(m: *Model) Allocator.Error!Effect {
-        if (m.busy != null) return m.showBusy();
         const targets = try m.collectTargets(.active);
         if (targets.len == 0) {
             m.gpa.free(targets);
+            if (m.busy != null) return m.showBusy();
             m.setNotice(.info, "Nothing to deactivate: choose an active role (●).");
             return .none;
         }
@@ -524,7 +535,7 @@ pub const Model = struct {
             m.setNotice(.failed, "A justification is required.");
             return .none;
         }
-        const working = try m.gpa.dupe(Row, m.targets);
+        const working = try std.mem.concat(m.gpa, Row, &.{ m.working, m.targets });
         errdefer m.gpa.free(working);
         const job: ActivateJob = .{
             .targets = m.targets,
@@ -539,7 +550,7 @@ pub const Model = struct {
     }
 
     fn submitDeactivate(m: *Model) Allocator.Error!Effect {
-        const working = try m.gpa.dupe(Row, m.targets);
+        const working = try std.mem.concat(m.gpa, Row, &.{ m.working, m.targets });
         const targets = m.targets;
         m.targets = &.{};
         m.closeOverlay();
@@ -549,7 +560,7 @@ pub const Model = struct {
     }
 
     fn beginOperation(m: *Model, label: []const u8, working: []Row) void {
-        m.busy = label;
+        m.busy = if (m.busy != null and !std.mem.eql(u8, m.busy.?, label)) "Processing" else label;
         m.gpa.free(m.working);
         m.working = working;
         if (m.progress_window) m.mode = .progress;
@@ -557,7 +568,7 @@ pub const Model = struct {
 
     /// Explains the wait and brings back the progress view, if enabled.
     fn showBusy(m: *Model) Effect {
-        m.setNotice(.info, "An operation is running. You can close the picker; it will continue in the background.");
+        m.setNotice(.info, "Those roles are already being processed. Choose another role, or close the picker while work continues.");
         if (m.progress_window) m.mode = .progress;
         return .none;
     }
@@ -574,9 +585,15 @@ pub const Model = struct {
         var out: std.ArrayList(Row) = .empty;
         errdefer out.deinit(m.gpa);
         if (m.selected.count() > 0) {
-            for (m.rows) |r| if (r.state == state and m.isSelected(r)) try out.append(m.gpa, r);
+            for (m.rows) |r| {
+                if (r.state != state or !m.isSelected(r) or m.isWorking(r)) continue;
+                const duplicate = for (out.items) |existing| {
+                    if (rows_mod.sameRole(r, existing)) break true;
+                } else false;
+                if (!duplicate) try out.append(m.gpa, r);
+            }
         } else if (m.currentRow()) |r| {
-            if (r.state == state) try out.append(m.gpa, r);
+            if (r.state == state and !m.isWorking(r)) try out.append(m.gpa, r);
         }
         return out.toOwnedSlice(m.gpa);
     }
@@ -657,7 +674,7 @@ const testing = std.testing;
 
 fn testRow(id: []const u8, scope_name: []const u8, state: rows_mod.State) Row {
     return .{
-        .eligibility = .{ .schedule_id = id, .scope = "", .scope_name = scope_name, .role_definition_id = "", .role_name = "Contributor" },
+        .eligibility = .{ .schedule_id = id, .scope = scope_name, .scope_name = scope_name, .role_definition_id = "contributor", .role_name = "Contributor" },
         .subscription_name = "Sub",
         .state = state,
     };
@@ -829,12 +846,68 @@ test "ctrl-d asks for confirmation before deactivating" {
     try testing.expectEqualStrings("Deactivating", m.busy.?);
 }
 
-test "busy operations block new ones" {
+test "busy roles block duplicates but allow activating a different role" {
     var m = try loaded();
     defer m.deinit();
-    m.busy = "Activating";
+    try m.setRunning("Activating", fixture[0..1], 1);
     try testing.expectEqual(Effect.none, try press(&m, .enter));
     try testing.expectEqual(Mode.browse, m.mode);
+    _ = try press(&m, .down);
+    const form = try press(&m, .enter);
+    defer freeEffect(form);
+    try testing.expectEqualStrings("e2", form.load_policies[0].eligibility.schedule_id);
+    m.justification.set("another role");
+    const submit = try press(&m, .enter);
+    defer freeEffect(submit);
+    try testing.expectEqual(@as(usize, 1), submit.activate.targets.len);
+    try testing.expectEqual(@as(usize, 2), m.working.len);
+    try testing.expect(m.isWorking(fixture[0]) and m.isWorking(fixture[1]));
+}
+
+test "mixed selections skip running roles and deduplicate equivalent eligibilities" {
+    var m = try loaded();
+    defer m.deinit();
+    try m.setRunning("Activating", fixture[0..1], 1);
+    _ = try press(&m, .tab);
+    _ = try press(&m, .tab);
+    const form = try press(&m, .enter);
+    defer freeEffect(form);
+    try testing.expectEqual(@as(usize, 1), form.load_policies.len);
+    try testing.expectEqualStrings("e2", form.load_policies[0].eligibility.schedule_id);
+    _ = try press(&m, .escape);
+    m.clearSelection();
+    var equivalent = fixture[1];
+    equivalent.eligibility.schedule_id = "same-role-other-eligibility";
+    const both = [_]Row{ fixture[1], equivalent };
+    try m.setRows(&both, 2);
+    _ = try press(&m, .tab);
+    _ = try press(&m, .tab);
+    const duplicate = try press(&m, .enter);
+    defer freeEffect(duplicate);
+    try testing.expectEqual(@as(usize, 1), duplicate.load_policies.len);
+}
+
+test "running job updates preserve a new form and allow disjoint deactivation" {
+    var m = try loaded();
+    defer m.deinit();
+    try m.setRunning("Activating", fixture[0..1], 10);
+    _ = try press(&m, .down);
+    const form = try press(&m, .enter);
+    defer freeEffect(form);
+    m.justification.set("keep editing");
+    try m.setRunning("Activating", &.{}, 0);
+    try testing.expectEqual(Mode.form, m.mode);
+    try testing.expectEqualStrings("keep editing", m.justification.text());
+    try testing.expectEqualStrings("e2", m.targets[0].eligibility.schedule_id);
+    _ = try press(&m, .escape);
+    try m.setRunning("Activating", fixture[0..1], 10);
+    _ = try press(&m, .down);
+    try testing.expectEqual(Effect.none, try press(&m, .deactivate));
+    try testing.expectEqual(Mode.confirm_deactivate, m.mode);
+    const submit = try press(&m, .enter);
+    defer freeEffect(submit);
+    try testing.expectEqual(@as(usize, 2), m.working.len);
+    try testing.expectEqualStrings("Processing", m.busy.?);
 }
 
 test "Azure sign-in is unavailable unless explicitly enabled" {
@@ -956,7 +1029,7 @@ test "with the progress window, busy operations bring it back" {
     var m = try loaded();
     defer m.deinit();
     m.progress_window = true;
-    m.busy = "Activating";
+    try m.setRunning("Activating", fixture[0..1], 1);
     try testing.expectEqual(Effect.none, try press(&m, .enter));
     try testing.expectEqual(Mode.progress, m.mode);
     try testing.expect(m.notice != null);

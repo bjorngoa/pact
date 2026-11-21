@@ -102,7 +102,9 @@ Run `pim help` for every option.
 
 While an activation or deactivation runs, the header shows a spinner. For something easier to notice, opt in with `PIM_PROGRESS_WINDOW=1`: a progress window then shows the roles, a progress bar and the elapsed time, and the affected rows show a spinner. `esc` hides the window while the operation keeps running; enter or ctrl-d brings it back.
 
-**You can close the picker or Herdr popup while roles are activating or deactivating.** Operations run in an independent background worker; closing the popup dismisses the UI, not the operation. Reopen the picker to see the running roles or the last operation's results. A Herdr notification reports completion, failures, or requests still pending approval/application. Only one picker operation runs at a time, including across reopened popups. If a worker is interrupted, the picker reports it without automatically resubmitting requests; refresh the roles before retrying.
+**You can close the picker or Herdr popup while roles are activating or deactivating.** Operations run in independent background workers; closing the popup dismisses the UI, not the operations. Reopen the picker to see running roles and saved results. Each operation sends a Herdr notification for completion, failures, or requests still pending approval/application. If a worker is interrupted, the picker reports it without automatically resubmitting requests; refresh the roles before retrying.
+
+**You can activate another role without waiting for earlier ones.** Hide the optional progress window with **esc**, choose another role, and activate it normally. Different roles run in parallel, including after reopening the popup. Running roles show a spinner; selected roles already being processed are skipped. A scope/role pair cannot have two in-flight requests, even through different eligibilities or separate popups, and activation/deactivation of the same role cannot overlap. Completing one operation does not dismiss a form you are editing for another.
 
 ### Optional in-popup Azure sign-in
 
@@ -152,7 +154,7 @@ What you get:
 
 - **Network:** `pim` talks only to `https://management.azure.com` (the ARM PIM APIs, version `2020-10-01`). Tokens come from `az account get-access-token`, with Azure CLI telemetry turned off for those calls (`AZURE_CORE_COLLECT_TELEMETRY=false`).
 - **Tokens:** kept in memory only, never written to disk or logs. Redirects are not followed, and pagination links pointing anywhere other than `management.azure.com` are refused, so a token can never be sent to another host.
-- **Cache:** the state directory holds `snapshot.json` (roles, scopes, end times), `alerts.json` (notifications already sent), and `operation.json`/`operation.lock` (the last picker operation and its worker lock). Files are written with mode `0600`, in a `0700` directory; JSON updates are atomic. The justification is handed to the worker in the private operation file and removed before it contacts Azure. No tokens are persisted.
+- **Cache:** the state directory holds `snapshot.json` (roles, scopes, end times), `alerts.json` (notifications already sent), `operations/` (individual picker jobs and worker locks), and `operations.lock` (short-lived coordination while reserving jobs). Legacy `operation.json`/`operation.lock` state remains readable. Files are written with mode `0600`, in `0700` directories; JSON updates are atomic. Justifications are handed to workers in private job files and removed before contacting Azure. No tokens are persisted.
 - **Display:** names returned by Azure are stripped of control characters before they are shown, so they cannot inject terminal escape sequences.
 - **What it does in Azure:** only self-activation and self-deactivation requests (`roleAssignmentScheduleRequests`, `SelfActivate`/`SelfDeactivate`) for your own principal, which is read from your token. Azure enforces every PIM policy.
 

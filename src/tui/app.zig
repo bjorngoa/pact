@@ -50,7 +50,7 @@ const Batch = struct {
     fetched_at: i64 = 0,
     plans: []const activation.Plan = &.{},
     failure: ?[]const u8 = null,
-    job: ?background_job.Job = null,
+    jobs: []const background_job.Job = &.{},
     generation: u64 = 0,
     authentication_required: bool = false,
 
@@ -85,6 +85,7 @@ const App = struct {
     rows_batch: ?*Batch = null,
     policies_batch: ?*Batch = null,
     job_batch: ?*Batch = null,
+    jobs_refresh_pending: bool = false,
     retired: std.ArrayList(*Batch) = .empty,
 
     fn deinit(app: *App) void {
@@ -159,7 +160,7 @@ const App = struct {
                 if (b.generation != app.generation) return app.retire(b);
                 if (b.failure) |msg| {
                     m.setRefreshFailed(msg);
-                    if (b.authentication_required) try m.requireSignIn();
+                    if (b.authentication_required) try app.offerSignIn(m);
                     try app.retire(b);
                 } else try app.adoptRows(m, b);
             },
@@ -170,7 +171,7 @@ const App = struct {
                 app.policies_batch = b;
                 if (b.failure) |msg| {
                     m.setNotice(.failed, msg);
-                    if (b.authentication_required) try m.requireSignIn();
+                    if (b.authentication_required) try app.offerSignIn(m);
                 } else m.setPolicies(b.plans);
             },
             .login_code => |update| {
@@ -191,6 +192,7 @@ const App = struct {
                     try app.retire(b);
                 } else {
                     try app.adoptRows(m, b);
+                    app.jobs_refresh_pending = false;
                     m.signInComplete();
                 }
             },
@@ -211,9 +213,13 @@ const App = struct {
         var arena: std.heap.ArenaAllocator = .init(app.gpa);
         defer arena.deinit();
         const child = background_job.start(app.session, arena.allocator(), intent, targets, duration_min, justification) catch |err| {
-            m.endOperation();
+            app.syncJobs(m, true) catch {
+                if (app.job_batch) |known| {
+                    app.applyJobs(m, known) catch {};
+                } else m.endOperation();
+            };
             m.setNotice(.failed, if (err == error.OperationInProgress)
-                "Another PIM operation is already running. Reopen the picker to see its progress."
+                "One of these roles is already being processed. No duplicate requests were submitted."
             else
                 "Could not start the background operation; no requests were submitted.");
             return;
@@ -225,39 +231,73 @@ const App = struct {
     }
 
     fn syncJob(app: *App, m: *Model) !void {
+        try app.syncJobs(m, false);
+    }
+
+    fn syncJobs(app: *App, m: *Model, force: bool) !void {
         const b = try Batch.create(app.gpa);
         errdefer b.release(app.gpa);
-        b.job = try background_job.load(b.allocator(), app.session.env);
-        const job = b.job orelse {
+        b.jobs = try background_job.loadAll(b.allocator(), app.session.env);
+        const previous = if (app.job_batch) |old| old.jobs else &.{};
+        if (!force and sameJobStates(previous, b.jobs)) {
             b.release(app.gpa);
+            app.refreshJobs(m);
             return;
-        };
-        if (app.job_batch) |old| {
-            const previous = old.job.?;
-            if (std.mem.eql(u8, previous.id, job.id) and previous.done == job.done) {
-                b.release(app.gpa);
-                return;
-            }
         }
         try app.retired.ensureUnusedCapacity(app.gpa, 1);
-        if (job.done) {
-            const was_running = m.busy != null;
-            m.setResults(job.lines);
-            if (job.failure) |msg| m.setNotice(.failed, msg);
-            if (job.authentication_required and m.sign_in_enabled) {
-                try m.rememberRetry(job.targets, job.intent, job.duration_min);
-                if (was_running or m.authentication_required) try m.requireSignIn();
-            }
-            if (!m.refreshing and (!job.authentication_required or !m.sign_in_enabled)) {
-                m.refreshing = true;
-                _ = app.spawn(m, refreshTask, .{ app, app.generation });
-            }
-        } else {
-            try m.restoreOperation(if (job.intent == .activate) "Activating" else "Deactivating", job.targets, job.started_at);
-            m.setNotice(.info, "You can close the picker. This operation will continue in the background.");
-        }
+        try app.applyJobs(m, b);
         if (app.job_batch) |old| app.retired.appendAssumeCapacity(old);
         app.job_batch = b;
+        app.refreshJobs(m);
+    }
+
+    fn applyJobs(app: *App, m: *Model, b: *Batch) !void {
+        const arena = b.allocator();
+        const previous = if (app.job_batch) |old| old.jobs else &.{};
+        var working: std.ArrayList(Row) = .empty;
+        var lines: std.ArrayList(messages.Line) = .empty;
+        var label: ?[]const u8 = null;
+        var since: i64 = 0;
+        var new_auth_failure = false;
+        const was_running = m.busy != null;
+        for (b.jobs) |job| {
+            if (!job.done) {
+                if (working.items.len == 0) since = job.started_at;
+                const action: []const u8 = if (job.intent == .activate) "Activating" else "Deactivating";
+                label = if (label == null or std.mem.eql(u8, label.?, action)) action else "Processing";
+                try working.appendSlice(arena, job.targets);
+                continue;
+            }
+            const newly_done = for (previous) |old| {
+                if (std.mem.eql(u8, old.id, job.id)) break !old.done;
+            } else true;
+            if (newly_done) {
+                app.jobs_refresh_pending = true;
+                if (job.authentication_required) new_auth_failure = true;
+            }
+            try lines.appendSlice(arena, job.lines);
+            if (job.failure) |failure|
+                try lines.append(arena, .{ .kind = .failed, .glyph = "!", .text = failure });
+        }
+        // All running workers remain represented when one finishes or a new one starts.
+        try m.setRunning(label orelse "Processing", working.items, since);
+        m.results = lines.items;
+        if (new_auth_failure and m.sign_in_enabled and (was_running or m.authentication_required))
+            m.authentication_required = true;
+        if (m.busy == null and m.authentication_required and m.sign_in_enabled)
+            try offerSignInForJobs(m, b.jobs);
+    }
+
+    fn offerSignIn(app: *App, m: *Model) !void {
+        return offerSignInForJobs(m, if (app.job_batch) |b| b.jobs else &.{});
+    }
+
+    fn refreshJobs(app: *App, m: *Model) void {
+        if (!app.jobs_refresh_pending or m.refreshing or m.sign_in_state == .running or m.sign_in_state == .refreshing) return;
+        if (m.sign_in_enabled and m.authentication_required) return;
+        m.refreshing = true;
+        if (app.spawn(m, refreshTask, .{ app, app.generation }))
+            app.jobs_refresh_pending = false;
     }
 
     fn adoptRows(app: *App, m: *Model, b: *Batch) Allocator.Error!void {
@@ -281,6 +321,33 @@ const App = struct {
         app.retired.clearRetainingCapacity();
     }
 };
+
+fn offerSignInForJobs(m: *Model, jobs: []const background_job.Job) !void {
+    // Keep an actively edited form's retry selection, otherwise recover failed batches.
+    if (m.sign_in_enabled and m.busy == null and m.mode == .browse and !m.authentication_prompted) {
+        var latest: ?background_job.Job = null;
+        for (jobs) |job| {
+            if (job.done and job.authentication_required) latest = job;
+        }
+        if (latest) |job| {
+            var targets: std.ArrayList(Row) = .empty;
+            defer targets.deinit(m.gpa);
+            for (jobs) |failed| {
+                if (failed.done and failed.authentication_required and failed.intent == job.intent)
+                    try targets.appendSlice(m.gpa, failed.targets);
+            }
+            try m.rememberRetry(targets.items, job.intent, job.duration_min);
+        }
+    }
+    try m.requireSignIn();
+}
+
+fn sameJobStates(a: []const background_job.Job, b: []const background_job.Job) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right|
+        if (!std.mem.eql(u8, left.id, right.id) or left.done != right.done) return false;
+    return true;
+}
 
 // ---- background tasks --------------------------------------------------------
 
@@ -498,4 +565,111 @@ test "login refresh replaces roles but stale pre-login results cannot reopen aut
     try testing.expectEqual(rows_mod.State.active, model.rows[0].state);
     try testing.expectEqual(@as(usize, 0), model.selected.count());
     try testing.expect(model.busy == null);
+}
+
+test "parallel jobs restore all running roles and one completion preserves an open form" {
+    const testing = std.testing;
+    var model: Model = .init(testing.allocator, 480);
+    defer model.deinit();
+    const a: Row = .{
+        .eligibility = .{ .schedule_id = "a", .scope = "/a", .scope_name = "a", .role_definition_id = "owner", .role_name = "Owner" },
+        .subscription_name = "Sub",
+        .state = .eligible,
+    };
+    var b = a;
+    b.eligibility.schedule_id = "b";
+    b.eligibility.scope = "/b";
+    var c = a;
+    c.eligibility.schedule_id = "c";
+    c.eligibility.scope = "/c";
+    try model.setRows(&.{ a, b, c }, 1);
+    var app: App = .{ .gpa = testing.allocator, .io = testing.io, .session = undefined, .loop = undefined };
+    const first = try Batch.create(testing.allocator);
+    defer first.release(testing.allocator);
+    first.jobs = &.{
+        .{ .id = "one", .intent = .activate, .targets = &.{a}, .duration_min = 60, .started_at = 10 },
+        .{ .id = "two", .intent = .activate, .targets = &.{b}, .duration_min = 60, .started_at = 11 },
+    };
+    try app.applyJobs(&model, first);
+    app.job_batch = first;
+    try testing.expectEqual(@as(usize, 2), model.working.len);
+    try testing.expectEqual(@as(i64, 10), model.busy_since);
+    _ = try model.update(.end);
+    const effect = try model.update(.enter);
+    defer testing.allocator.free(effect.load_policies);
+    model.justification.set("third role");
+
+    const second = try Batch.create(testing.allocator);
+    defer second.release(testing.allocator);
+    var completed = first.jobs[1];
+    completed.done = true;
+    completed.lines = &.{.{ .kind = .ok, .glyph = "*", .text = "b active" }};
+    second.jobs = &.{ first.jobs[0], completed };
+    try app.applyJobs(&model, second);
+    try testing.expectEqual(@as(usize, 1), model.working.len);
+    try testing.expect(model.isWorking(a) and !model.isWorking(b));
+    try testing.expectEqual(model_mod.Mode.form, model.mode);
+    try testing.expectEqualStrings("third role", model.justification.text());
+    try testing.expectEqualStrings("b active", model.results[0].text);
+    try testing.expect(app.jobs_refresh_pending);
+    app.job_batch = second;
+    const final = try Batch.create(testing.allocator);
+    defer final.release(testing.allocator);
+    var done = first.jobs[0];
+    done.done = true;
+    done.failure = "a failed";
+    final.jobs = &.{ done, completed };
+    try app.applyJobs(&model, final);
+    try testing.expect(model.busy == null);
+    try testing.expectEqual(@as(usize, 2), model.results.len);
+    try testing.expectEqual(model_mod.Mode.form, model.mode);
+}
+
+test "parallel authentication failures wait for workers then preserve all failed activation targets" {
+    const testing = std.testing;
+    var model: Model = .init(testing.allocator, 480);
+    defer model.deinit();
+    model.sign_in_enabled = true;
+    const a: Row = .{
+        .eligibility = .{ .schedule_id = "a", .scope = "/a", .scope_name = "a", .role_definition_id = "owner", .role_name = "Owner" },
+        .subscription_name = "Sub",
+        .state = .eligible,
+    };
+    var b = a;
+    b.eligibility.schedule_id = "b";
+    b.eligibility.scope = "/b";
+    try model.setRows(&.{ a, b }, 1);
+    var app: App = .{ .gpa = testing.allocator, .io = testing.io, .session = undefined, .loop = undefined };
+    const first = try Batch.create(testing.allocator);
+    defer first.release(testing.allocator);
+    first.jobs = &.{
+        .{ .id = "one", .intent = .activate, .targets = &.{a}, .duration_min = 60, .started_at = 10 },
+        .{ .id = "two", .intent = .activate, .targets = &.{b}, .duration_min = 90, .started_at = 11 },
+    };
+    try app.applyJobs(&model, first);
+    app.job_batch = first;
+    var failed_a = first.jobs[0];
+    failed_a.done = true;
+    failed_a.failure = "sign in";
+    failed_a.authentication_required = true;
+    const second = try Batch.create(testing.allocator);
+    defer second.release(testing.allocator);
+    second.jobs = &.{ failed_a, first.jobs[1] };
+    try app.applyJobs(&model, second);
+    try testing.expect(model.authentication_required);
+    try testing.expectEqual(model_mod.Mode.browse, model.mode);
+    try testing.expect(model.isWorking(b));
+    app.job_batch = second;
+    var failed_b = first.jobs[1];
+    failed_b.done = true;
+    failed_b.failure = "sign in";
+    failed_b.authentication_required = true;
+    const final = try Batch.create(testing.allocator);
+    defer final.release(testing.allocator);
+    final.jobs = &.{ failed_a, failed_b };
+    try app.applyJobs(&model, final);
+    try testing.expectEqual(model_mod.Mode.sign_in, model.mode);
+    try testing.expectEqual(@as(usize, 2), model.selected.count());
+    try testing.expect(model.busy == null);
+    try testing.expectEqual(@as(?u32, 90), model.retry_duration_min);
 }

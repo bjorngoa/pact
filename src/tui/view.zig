@@ -168,7 +168,7 @@ fn drawList(arena: Allocator, win: Window, m: *const Model, now: i64) Allocator.
             _ = print(line, 0, 0, "▌", .{ .fg = accent, .bg = base.bg });
         }
         if (m.isSelected(r)) _ = print(line, 0, 2, "✓", merge(base, style_selected));
-        if (m.progress_window and m.isWorking(r)) {
+        if (m.isWorking(r)) {
             _ = print(line, 0, 4, spinnerFrame(m), merge(base, style_working));
         } else _ = print(line, 0, 4, stateGlyph(r.state), merge(base, stateStyle(r.state)));
 

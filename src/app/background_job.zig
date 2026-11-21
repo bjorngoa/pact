@@ -15,6 +15,8 @@ const errors = @import("../present/errors.zig");
 pub const worker_command = "__background-worker";
 const file_name = "operation.json";
 const lock_name = "operation.lock";
+const jobs_dir_name = "operations";
+const registry_lock_name = "operations.lock";
 const private_file: std.Io.File.Permissions =
     if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file;
 const private_dir: std.Io.Dir.Permissions =
@@ -39,13 +41,11 @@ pub const Job = struct {
 /// Caller must reap the child, but must never kill it when the picker closes.
 pub fn start(session: *session_mod.Session, arena: std.mem.Allocator, intent: selection.Intent, targets: []const rows_mod.Row, duration_min: u32, justification: []const u8) !std.process.Child {
     const env = session.env;
-    const lock = try acquire(env.io, env.state_dir);
-    // Closing (not unlocking) preserves the child's inherited lock.
-    defer lock.close(env.io);
-
     const now = std.Io.Clock.real.now(env.io);
+    var random: [16]u8 = undefined;
+    try env.io.randomSecure(&random);
     var job: Job = .{
-        .id = try std.fmt.allocPrint(arena, "{d}", .{now.toNanoseconds()}),
+        .id = try arena.dupe(u8, &std.fmt.bytesToHex(random, .lower)),
         .intent = intent,
         .targets = targets,
         .duration_min = duration_min,
@@ -53,11 +53,15 @@ pub fn start(session: *session_mod.Session, arena: std.mem.Allocator, intent: se
         .justification = justification,
     };
     const exe = try std.process.executablePathAlloc(env.io, arena);
-    try store.save(Job, env.io, env.state_dir, file_name, job);
+    // Serialize only the reservation, not the Azure operation.
+    const registry = try acquireNamed(env.io, env.state_dir, registry_lock_name, false);
+    defer registry.close(env.io);
+    const reserved = try reserve(arena, env, job);
+    defer reserved.lock.close(env.io);
     return std.process.spawn(env.io, .{
         .argv = &.{ exe, worker_command, job.id },
         .environ_map = env.environ,
-        .stdin = .{ .file = lock },
+        .stdin = .{ .file = reserved.lock },
         .stdout = .ignore,
         .stderr = .ignore,
         .pgid = if (builtin.os.tag == .windows) null else 0,
@@ -66,19 +70,50 @@ pub fn start(session: *session_mod.Session, arena: std.mem.Allocator, intent: se
         job.done = true;
         job.justification = null;
         job.failure = "Could not start the background worker; no requests were submitted.";
-        try store.save(Job, env.io, env.state_dir, file_name, job);
+        try store.save(Job, env.io, reserved.dir, reserved.file, job);
         return err;
     };
 }
 
-fn acquire(io: std.Io, state_dir: []const u8) !std.Io.File {
+const Reservation = struct { lock: std.Io.File, dir: []const u8, file: []const u8 };
+
+/// Caller holds the short-lived registry lock until the worker inherits its lock.
+fn reserve(arena: std.mem.Allocator, env: session_mod.Env, job: Job) !Reservation {
+    if (job.targets.len == 0) return error.NothingSelected;
+    for (job.targets, 0..) |target, i| {
+        for (job.targets[0..i]) |earlier|
+            if (rows_mod.sameRole(target, earlier)) return error.OperationInProgress;
+    }
+    const existing = try loadAllUnlocked(arena, env);
+    for (existing) |other| {
+        if (other.done) continue;
+        for (other.targets) |working| {
+            for (job.targets) |target|
+                if (rows_mod.sameRole(working, target)) return error.OperationInProgress;
+        }
+    }
+    const dir = try std.fs.path.join(arena, &.{ env.state_dir, jobs_dir_name });
+    const file = try jobFile(arena, job.id, ".json");
+    const lock = try acquireNamed(env.io, dir, try jobFile(arena, job.id, ".lock"), true);
+    errdefer lock.close(env.io);
+    try store.save(Job, env.io, dir, file, job);
+    return .{ .lock = lock, .dir = dir, .file = file };
+}
+
+fn jobFile(arena: std.mem.Allocator, id: []const u8, extension: []const u8) ![]const u8 {
+    if (id.len == 0 or id.len > 64) return error.InvalidJobId;
+    for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return error.InvalidJobId;
+    return std.mem.concat(arena, u8, &.{ id, extension });
+}
+
+fn acquireNamed(io: std.Io, state_dir: []const u8, name: []const u8, nonblocking: bool) !std.Io.File {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, state_dir, .{ .permissions = private_dir });
     defer dir.close(io);
-    return dir.createFile(io, lock_name, .{
+    return dir.createFile(io, name, .{
         .read = true,
         .truncate = false,
         .lock = .exclusive,
-        .lock_nonblocking = true,
+        .lock_nonblocking = nonblocking,
         .permissions = private_file,
     }) catch |err| switch (err) {
         error.WouldBlock => error.OperationInProgress,
@@ -88,34 +123,76 @@ fn acquire(io: std.Io, state_dir: []const u8) !std.Io.File {
 
 /// A lost worker is reported, never retried: Azure may have accepted requests.
 pub fn load(arena: std.mem.Allocator, env: session_mod.Env) !?Job {
-    const path = try std.fs.path.join(arena, &.{ env.state_dir, lock_name });
-    const lock = std.Io.Dir.cwd().openFile(env.io, path, .{
+    return loadOne(arena, env.io, env.state_dir, file_name, lock_name);
+}
+
+pub fn loadAll(arena: std.mem.Allocator, env: session_mod.Env) ![]const Job {
+    const registry = try acquireNamed(env.io, env.state_dir, registry_lock_name, false);
+    defer registry.close(env.io);
+    return loadAllUnlocked(arena, env);
+}
+
+fn loadAllUnlocked(arena: std.mem.Allocator, env: session_mod.Env) ![]const Job {
+    var jobs: std.ArrayList(Job) = .empty;
+    // Keep an operation started by an older installed binary visible and protected.
+    if (try load(arena, env)) |legacy| try jobs.append(arena, legacy);
+    const dir_path = try std.fs.path.join(arena, &.{ env.state_dir, jobs_dir_name });
+    var dir = std.Io.Dir.cwd().openDir(env.io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return jobs.toOwnedSlice(arena),
+        else => return err,
+    };
+    defer dir.close(env.io);
+    var iterator = dir.iterate();
+    while (try iterator.next(env.io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const id = entry.name[0 .. entry.name.len - ".json".len];
+        const lock_file = try jobFile(arena, id, ".lock");
+        const job = try loadOne(arena, env.io, dir_path, entry.name, lock_file) orelse return error.InvalidJobState;
+        try jobs.append(arena, job);
+    }
+    std.mem.sort(Job, jobs.items, {}, struct {
+        fn less(_: void, a: Job, b: Job) bool {
+            if (a.started_at != b.started_at) return a.started_at < b.started_at;
+            return std.mem.lessThan(u8, a.id, b.id);
+        }
+    }.less);
+    return jobs.toOwnedSlice(arena);
+}
+
+fn loadOne(arena: std.mem.Allocator, io: std.Io, dir: []const u8, file: []const u8, lock_file: []const u8) !?Job {
+    const path = try std.fs.path.join(arena, &.{ dir, lock_file });
+    const lock = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = .read_write,
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
         error.FileNotFound => return null,
-        error.WouldBlock => return store.load(Job, arena, env.io, env.state_dir, file_name),
+        error.WouldBlock => return store.load(Job, arena, io, dir, file) orelse error.InvalidJobState,
         else => return err,
     };
-    defer lock.close(env.io);
-    var job = store.load(Job, arena, env.io, env.state_dir, file_name) orelse return null;
+    defer lock.close(io);
+    var job = store.load(Job, arena, io, dir, file) orelse return null;
     if (!job.done) {
         job.done = true;
         job.justification = null;
         job.failure = "The background worker stopped. Some requests may have reached Azure; refresh roles before retrying.";
-        try store.save(Job, env.io, env.state_dir, file_name, job);
+        try store.save(Job, io, dir, file, job);
     }
     return job;
 }
 
 pub fn run(session: *session_mod.Session, id: []const u8) !void {
     const env = session.env;
-    var job = store.load(Job, session.arena, env.io, env.state_dir, file_name) orelse return error.NoJob;
+    const new_dir = try std.fs.path.join(session.arena, &.{ env.state_dir, jobs_dir_name });
+    const new_file = try jobFile(session.arena, id, ".json");
+    const new_job = store.load(Job, session.arena, env.io, new_dir, new_file);
+    const dir = if (new_job != null) new_dir else env.state_dir;
+    const file = if (new_job != null) new_file else file_name;
+    var job = new_job orelse store.load(Job, session.arena, env.io, dir, file) orelse return error.NoJob;
     if (job.done or !std.mem.eql(u8, job.id, id)) return error.NoJob;
     const justification = job.justification orelse "";
     job.justification = null;
-    try store.save(Job, env.io, env.state_dir, file_name, job);
+    try store.save(Job, env.io, dir, file, job);
 
     var diag: session_mod.Diagnostics = .{};
     execute(session, &job, justification, &diag) catch |err| {
@@ -123,7 +200,7 @@ pub fn run(session: *session_mod.Session, id: []const u8) !void {
         job.failure = try errors.summaryAlloc(session.arena, err, diag);
     };
     job.done = true;
-    try store.save(Job, env.io, env.state_dir, file_name, job);
+    try store.save(Job, env.io, dir, file, job);
     const notification = try describeNotification(session.arena, job);
     herdr.Notifier.fromEnv(env.environ).show(session.arena, env.io, notification.title, notification.body) catch |err|
         std.log.warn("cannot notify about background operation: {t}", .{err});
@@ -203,6 +280,10 @@ fn describeNotification(arena: std.mem.Allocator, job: Job) !messages.Notificati
 
 const testing = std.testing;
 
+fn acquire(io: std.Io, state_dir: []const u8) !std.Io.File {
+    return acquireNamed(io, state_dir, lock_name, true);
+}
+
 fn testJob() Job {
     return .{ .id = "test", .intent = .activate, .targets = &.{}, .duration_min = 60, .started_at = 1 };
 }
@@ -279,6 +360,100 @@ test "completed results survive an unlocked worker without being marked interrup
     const completed = (try load(arena, env)).?;
     try testing.expect(completed.done and completed.failure == null);
     try testing.expectEqualStrings("Owner: active", completed.lines[0].text);
+}
+
+fn testTarget(scope: []const u8, role: []const u8, schedule: []const u8) rows_mod.Row {
+    return .{
+        .eligibility = .{ .schedule_id = schedule, .scope = scope, .scope_name = scope, .role_definition_id = role, .role_name = role },
+        .subscription_name = "Sub",
+        .state = .eligible,
+    };
+}
+
+test "separate jobs run together while conflicting scope-role requests are rejected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ: std.process.Environ.Map = .init(arena);
+    const env: session_mod.Env = .{ .io = io, .gpa = testing.allocator, .environ = &environ, .state_dir = dir };
+    const registry = try acquireNamed(io, dir, registry_lock_name, false);
+    defer registry.close(io);
+    var first = testJob();
+    first.id = "first";
+    first.targets = &.{testTarget("/subscriptions/a/resourceGroups/rg", "/roles/owner", "eligibility-one")};
+    const a = try reserve(arena, env, first);
+    var a_closed = false;
+    defer if (!a_closed) a.lock.close(io);
+
+    var duplicate = first;
+    duplicate.id = "duplicate";
+    duplicate.intent = .deactivate;
+    duplicate.targets = &.{testTarget("/SUBSCRIPTIONS/A/resourceGroups/RG/", "OWNER", "another-eligibility")};
+    try testing.expectError(error.OperationInProgress, reserve(arena, env, duplicate));
+
+    var second = first;
+    second.id = "second";
+    second.targets = &.{testTarget("/subscriptions/a/resourceGroups/other", "owner", "eligibility-two")};
+    const b = try reserve(arena, env, second);
+    defer b.lock.close(io);
+    var third = first;
+    third.id = "third";
+    third.targets = &.{testTarget("/subscriptions/a/resourceGroups/rg", "reader", "eligibility-three")};
+    const c = try reserve(arena, env, third);
+    defer c.lock.close(io);
+    const all = try loadAllUnlocked(arena, env);
+    try testing.expectEqual(@as(usize, 3), all.len);
+    for (all) |job| try testing.expect(!job.done);
+
+    // Completing one job neither overwrites nor cancels another job.
+    first.done = true;
+    first.lines = &.{.{ .kind = .ok, .glyph = "*", .text = "first active" }};
+    try store.save(Job, io, a.dir, a.file, first);
+    a.lock.close(io);
+    a_closed = true;
+    const after = try loadAllUnlocked(arena, env);
+    var active_count: usize = 0;
+    for (after) |job| {
+        if (!job.done) active_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), active_count);
+    const retry = try reserve(arena, env, duplicate);
+    retry.lock.close(io);
+}
+
+test "a lost job is reported individually while a legacy worker remains protected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ: std.process.Environ.Map = .init(arena);
+    const env: session_mod.Env = .{ .io = io, .gpa = testing.allocator, .environ = &environ, .state_dir = dir };
+    var legacy = testJob();
+    legacy.targets = &.{testTarget("/subscriptions/one", "owner", "legacy")};
+    const old_lock = try acquire(io, dir);
+    defer old_lock.close(io);
+    try store.save(Job, io, dir, file_name, legacy);
+    var new = legacy;
+    new.id = "new";
+    try testing.expectError(error.OperationInProgress, reserve(arena, env, new));
+    new.targets = &.{testTarget("/subscriptions/two", "owner", "new")};
+    new.justification = "private reason";
+    const reserved = try reserve(arena, env, new);
+    reserved.lock.close(io);
+    const jobs = try loadAll(arena, env);
+    try testing.expectEqual(@as(usize, 2), jobs.len);
+    for (jobs) |job| {
+        if (std.mem.eql(u8, job.id, new.id)) {
+            try testing.expect(job.done and job.failure != null and job.justification == null);
+        } else try testing.expect(!job.done);
+    }
 }
 
 test "completion notifications distinguish failures, pending and success" {
