@@ -56,6 +56,7 @@ pub const Effect = union(enum) {
     refresh,
     sign_in: azure_login.Method,
     cancel_sign_in,
+    dismiss_sign_in,
     load_policies: []Row,
     activate: ActivateJob,
     deactivate: []Row,
@@ -136,6 +137,8 @@ pub const Model = struct {
     refreshing: bool = false,
     /// Static label of the running operation.
     busy: ?[]const u8 = null,
+    workers_running: bool = false,
+    working_from_jobs: bool = false,
     /// When the running operation started, in seconds; set by the app.
     busy_since: i64 = 0,
     /// Rows of the running operation. Owned; strings borrowed like `targets`.
@@ -258,6 +261,8 @@ pub const Model = struct {
     /// Clears the running operation and closes its progress view.
     pub fn endOperation(m: *Model) void {
         m.busy = null;
+        m.workers_running = false;
+        m.working_from_jobs = false;
         m.gpa.free(m.working);
         m.working = &.{};
         if (m.mode == .progress) m.mode = .browse;
@@ -276,6 +281,7 @@ pub const Model = struct {
         const working = try m.gpa.dupe(Row, targets);
         m.gpa.free(m.working);
         m.working = working;
+        m.working_from_jobs = true;
         m.busy = if (working.len > 0) label else null;
         m.busy_since = started_at;
         if (working.len == 0 and m.mode == .progress) m.mode = .browse;
@@ -296,7 +302,7 @@ pub const Model = struct {
 
     pub fn requireSignIn(m: *Model) Allocator.Error!void {
         m.authentication_required = true;
-        if (!m.sign_in_enabled or m.busy != null or m.authentication_prompted or m.sign_in_state == .running or m.sign_in_state == .refreshing) return;
+        if (!m.sign_in_enabled or m.workers_running or m.authentication_prompted or m.sign_in_state == .running or m.sign_in_state == .refreshing) return;
         if (m.targets.len > 0) try m.rememberRetry(m.targets, .activate, duration.parse(m.duration_text.text()) catch m.default_duration_min);
         m.closeOverlay();
         m.authentication_prompted = true;
@@ -357,7 +363,7 @@ pub const Model = struct {
         m.notice = null;
         if (input == .sign_in) {
             if (!m.sign_in_enabled) return .none;
-            if (m.busy != null) return m.showBusy();
+            if (m.workers_running) return m.showBusy();
             if (m.sign_in_state != .running and m.sign_in_state != .refreshing) {
                 m.sign_in_state = .required;
                 m.sign_in_error = null;
@@ -462,7 +468,7 @@ pub const Model = struct {
             m.sign_in_state = .required;
             m.sign_in_code = null;
             m.mode = .browse;
-            return if (running) .cancel_sign_in else .none;
+            return if (running) .cancel_sign_in else .dismiss_sign_in;
         }
         if (m.sign_in_state == .ready) {
             if (input == .enter) {
@@ -560,6 +566,8 @@ pub const Model = struct {
     }
 
     fn beginOperation(m: *Model, label: []const u8, working: []Row) void {
+        m.workers_running = true;
+        m.working_from_jobs = false;
         m.busy = if (m.busy != null and !std.mem.eql(u8, m.busy.?, label)) "Processing" else label;
         m.gpa.free(m.working);
         m.working = working;
@@ -701,7 +709,7 @@ fn freeEffect(effect: Effect) void {
             testing.allocator.free(job.targets);
             testing.allocator.free(job.justification);
         },
-        .none, .quit, .refresh, .sign_in, .cancel_sign_in => {},
+        .none, .quit, .refresh, .sign_in, .cancel_sign_in, .dismiss_sign_in => {},
     }
 }
 
@@ -1002,6 +1010,7 @@ test "authentication errors do not interrupt a running role operation" {
     defer m.deinit();
     m.sign_in_enabled = true;
     m.busy = "Activating";
+    m.workers_running = true;
     try m.requireSignIn();
     try testing.expectEqual(Mode.browse, m.mode);
     try testing.expectEqual(Effect.none, try press(&m, .sign_in));

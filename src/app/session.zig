@@ -10,6 +10,7 @@ pub const Env = struct {
     gpa: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
     state_dir: []const u8,
+    arm_base_url: []const u8 = arm.default_base_url,
 };
 
 /// Details for the most recent failure, for user-facing messages.
@@ -28,6 +29,10 @@ pub const Session = struct {
     mutex: std.Io.Mutex = .init,
     token: ?azcli.Token = null,
     authorization: []const u8 = "",
+    account_key: ?[]const u8 = null,
+    expected_account_key: ?[]const u8 = null,
+    principal_id: ?[]const u8 = null,
+    expected_principal_id: ?[]const u8 = null,
 
     /// The session must not be moved after `client()` has been called.
     pub fn init(arena: std.mem.Allocator, env: Env) Session {
@@ -50,18 +55,43 @@ pub const Session = struct {
     pub fn client(self: *Session, diag: *Diagnostics) azcli.Error!arm.Client {
         self.mutex.lockUncancelable(self.env.io);
         defer self.mutex.unlock(self.env.io);
+        _ = try self.identityLocked(diag);
         if (needsToken(self.token, std.Io.Clock.real.now(self.env.io).toSeconds())) {
             const token = try azcli.getToken(self.arena, self.env.io, self.env.environ, azcli.arm_resource, &diag.az);
+            const principal = try azcli.objectId(self.arena, token.value);
+            if (self.expected_principal_id orelse self.principal_id) |expected|
+                if (!std.mem.eql(u8, expected, principal)) return error.IdentityChanged;
+            if (self.principal_id == null) self.principal_id = principal;
             self.authorization = try std.fmt.allocPrint(self.arena, "Bearer {s}", .{token.value});
             self.token = token;
         }
-        return .{ .http = &self.http, .authorization = self.authorization };
+        return .{ .http = &self.http, .authorization = self.authorization, .base_url = self.env.arm_base_url };
+    }
+
+    pub fn identityKey(self: *Session, diag: *Diagnostics) azcli.Error![]const u8 {
+        try self.mutex.lock(self.env.io);
+        defer self.mutex.unlock(self.env.io);
+        return self.identityLocked(diag);
+    }
+
+    fn identityLocked(self: *Session, diag: *Diagnostics) azcli.Error![]const u8 {
+        var scratch: std.heap.ArenaAllocator = .init(self.env.gpa);
+        defer scratch.deinit();
+        const key = try azcli.accountKey(scratch.allocator(), self.env.io, self.env.environ, &diag.az);
+        if (self.expected_account_key orelse self.account_key) |expected|
+            if (!std.mem.eql(u8, expected, key)) return error.IdentityChanged;
+        if (self.account_key == null) self.account_key = try self.arena.dupe(u8, key);
+        return self.account_key.?;
+    }
+
+    pub fn cacheDir(self: *Session, arena: std.mem.Allocator, diag: *Diagnostics) azcli.Error![]const u8 {
+        return std.fs.path.join(arena, &.{ self.env.state_dir, "accounts", try self.identityKey(diag) });
     }
 
     /// Object id of the signed-in user, needed for self-activation requests.
     pub fn principalId(self: *Session, diag: *Diagnostics) azcli.Error![]const u8 {
         _ = try self.client(diag);
-        return azcli.objectId(self.arena, self.token.?.value);
+        return self.principal_id.?;
     }
 };
 

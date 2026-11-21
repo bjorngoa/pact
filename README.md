@@ -106,6 +106,10 @@ While an activation or deactivation runs, the header shows a spinner. For someth
 
 **You can activate another role without waiting for earlier ones.** Hide the optional progress window with **esc**, choose another role, and activate it normally. Different roles run in parallel, including after reopening the popup. Running roles show a spinner; selected roles already being processed are skipped. A scope/role pair cannot have two in-flight requests, even through different eligibilities or separate popups, and activation/deactivation of the same role cannot overlap. Completing one operation does not dismiss a form you are editing for another.
 
+The same conflict protection applies to `pim up` and `pim down`. Azure request IDs are saved before submission, and pending approvals or uncertain network outcomes continue blocking conflicting requests after the worker exits. The picker and non-cached list/status commands reconcile these requests with Azure; `pim ls --refresh` forces a check. A missing or unreadable Azure request remains uncertain rather than being automatically resubmitted. Verify such requests in the Azure portal before taking further action.
+
+State is separated by Azure cloud, tenant, account type and account name. Workers also verify the original principal ID before submitting. If the Azure account changes while a picker is open, reopen the picker rather than reusing its selections. Existing unbound snapshot caches are ignored and refetched; legacy interrupted jobs without request IDs are retained conservatively for manual verification.
+
 ### Optional in-popup Azure sign-in
 
 Sign-in support is **off by default**. Enable it with `PIM_SIGN_IN=1 pim pick`, or change your Herdr popup command to:
@@ -119,6 +123,8 @@ With this opt-in, an expired Azure session offers **Sign in to Azure**, and **ct
 **ctrl-l** always opens the sign-in dialog; it does not first check whether your current Azure session is still valid. Login only starts after you explicitly choose browser or device-code sign-in.
 
 After sign-in, roles are refreshed and your selection is preserved. For a failed operation, **enter** opens the normal activation form (or deactivation confirmation) for review; roles already active or still pending are excluded from activation retries. Nothing is submitted automatically. **esc** cancels sign-in or dismisses the dialog; quitting the picker also cancels an unfinished sign-in, not an already-running role operation. If login or refresh fails, the popup stays open with a retry option. Device codes are kept in memory, never in the PIM cache; Azure CLI manages its own normal credential cache.
+
+Retry selection belongs to the latest unresolved authentication-failed batch, preserving that batch's duration. Older failures are not merged into it. Successful sign-in or dismissing the dialog acknowledges saved retry suggestions.
 
 ## herdr integration
 
@@ -154,7 +160,8 @@ What you get:
 
 - **Network:** `pim` talks only to `https://management.azure.com` (the ARM PIM APIs, version `2020-10-01`). Tokens come from `az account get-access-token`, with Azure CLI telemetry turned off for those calls (`AZURE_CORE_COLLECT_TELEMETRY=false`).
 - **Tokens:** kept in memory only, never written to disk or logs. Redirects are not followed, and pagination links pointing anywhere other than `management.azure.com` are refused, so a token can never be sent to another host.
-- **Cache:** the state directory holds `snapshot.json` (roles, scopes, end times), `alerts.json` (notifications already sent), `operations/` (individual picker jobs and worker locks), and `operations.lock` (short-lived coordination while reserving jobs). Legacy `operation.json`/`operation.lock` state remains readable. Files are written with mode `0600`, in `0700` directories; JSON updates are atomic. Justifications are handed to workers in private job files and removed before contacting Azure. No tokens are persisted.
+- **Cache:** account-scoped `snapshot.json` and `alerts.json` files live under `accounts/<account-hash>/`. `operations/` holds identity-bound picker and CLI jobs, with `operations.lock` for short-lived reservation coordination. Legacy `operation.json`/`operation.lock` state remains readable. Resolved history is limited to 20 jobs; active, unresolved and unacknowledged retry state is retained. Files are written with mode `0600`, in `0700` directories; JSON updates are atomic. Justifications are handed to workers in private job files and removed before contacting Azure. No tokens are persisted.
+- **Reliability:** ARM requests have a 30-second timeout per attempt and at most three attempts. Throttling honors numeric `Retry-After` values up to 20 seconds; longer or unsupported waits are returned without retrying early. Retries reuse the original request URL/ID. Ambiguous writes are reconciled rather than blindly resubmitted.
 - **Display:** names returned by Azure are stripped of control characters before they are shown, so they cannot inject terminal escape sequences.
 - **What it does in Azure:** only self-activation and self-deactivation requests (`roleAssignmentScheduleRequests`, `SelfActivate`/`SelfDeactivate`) for your own principal, which is read from your token. Azure enforces every PIM policy.
 
@@ -174,7 +181,7 @@ What you get:
 |---|---|
 | `could not get an Azure token` | Run `az login`. The message includes the first line of `az`'s own error. |
 | `the Azure CLI (az) was not found` | Install the Azure CLI and make sure it is on `PATH`. In herdr, commands run through `/bin/sh -lc`, so your login `PATH` applies. |
-| `needs a stronger sign-in (MFA / Conditional Access)` | Run `az logout`, then `az login`, completing MFA, and retry. |
+| Additional Conditional Access claims required | Complete activation in the Azure portal. Generic re-login does not necessarily satisfy an authentication context. |
 | `rejected by the PIM policy: ...ExpirationRule` | The duration exceeds the policy; use a shorter `-d`. |
 | `Azure only allows deactivation 5 minutes after activation` | Wait, then retry `pim down`. |
 | Status bar entry empty | Nothing is active, or the command failed. Run `pim status --refresh` in a terminal to see why. |
@@ -185,6 +192,7 @@ What you get:
 
 - Covers **Azure resource roles** (resource groups, subscriptions, resources) only. Entra ID directory roles and PIM for Groups are not supported.
 - Policies that require a **ticket number** are not supported; activate those in the Azure portal.
+- **Conditional Access authentication-context/claims challenges** require activation in the Azure portal; the optional sign-in flow handles ordinary expired sessions, not arbitrary claims challenges.
 - **Windows** builds compile but are untested (for example, starting `az.cmd`).
 
 ## Development
@@ -194,6 +202,8 @@ zig build test --summary all     # unit tests (no network access)
 zig build fmt                    # formatting check
 zig build run -- ls --cached     # run from source
 ```
+
+CI runs tests, formatting and a ReleaseSafe build on Linux and macOS. ARM integration checks use local fixtures/mocks rather than live Azure credentials.
 
 The code follows a ports-and-adapters layout, and `src/main.zig` is the only place where everything is wired together:
 

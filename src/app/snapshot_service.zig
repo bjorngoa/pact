@@ -35,7 +35,8 @@ pub const Result = struct {
 
 /// Results are owned by `arena`, which must be thread-safe.
 pub fn get(session: *Session, arena: std.mem.Allocator, now: i64, policy: Policy, diag: *Diagnostics) GetError!Result {
-    const cached = cache.load(arena, session.env.io, session.env.state_dir);
+    const cache_dir = try session.cacheDir(arena, diag);
+    const cached = cache.load(arena, session.env.io, cache_dir);
     if (policy.offline) {
         const snapshot = cached orelse return error.NoCachedSnapshot;
         return .{ .snapshot = snapshot, .source = .cache };
@@ -56,13 +57,16 @@ pub fn get(session: *Session, arena: std.mem.Allocator, now: i64, policy: Policy
 /// which must be thread-safe.
 pub fn refresh(session: *Session, arena: std.mem.Allocator, now: i64, diag: *Diagnostics) FetchError!role.Snapshot {
     const snapshot = try fetch(session, arena, now, diag);
-    cache.save(session.env.io, session.env.state_dir, snapshot) catch |err| log.warn("cannot write cache: {t}", .{err});
+    const cache_dir = try session.cacheDir(arena, diag);
+    cache.save(session.env.io, cache_dir, snapshot) catch |err| log.warn("cannot write cache: {t}", .{err});
     return snapshot;
 }
 
 /// Loads the cached snapshot without any network access.
 pub fn loadCached(session: *Session, arena: std.mem.Allocator) ?role.Snapshot {
-    return cache.load(arena, session.env.io, session.env.state_dir);
+    var diag: Diagnostics = .{};
+    const cache_dir = session.cacheDir(arena, &diag) catch return null;
+    return cache.load(arena, session.env.io, cache_dir);
 }
 
 fn fetch(session: *Session, arena: std.mem.Allocator, now: i64, diag: *Diagnostics) FetchError!role.Snapshot {

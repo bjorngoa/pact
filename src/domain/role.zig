@@ -1,6 +1,7 @@
 //! PIM facts as fetched from Azure. All slices are borrowed; whoever builds a
 //! `Snapshot` owns the backing memory (typically an arena).
 const std = @import("std");
+const request_status = @import("request_status.zig");
 
 /// A role the user may activate through PIM (directly or via a group).
 pub const Eligibility = struct {
@@ -41,15 +42,15 @@ pub const Request = struct {
     /// True when Azure has accepted the request but not yet provisioned or rejected it.
     pub fn isInFlight(self: Request, now: i64) bool {
         if (now - self.created_at > max_in_flight_age_s) return false;
-        if (std.mem.startsWith(u8, self.status, "Pending")) return true;
-        const in_flight = [_][]const u8{ "Accepted", "Granted", "AdminApproved", "ProvisioningStarted", "ScheduleCreated" };
-        for (in_flight) |s| if (std.mem.eql(u8, self.status, s)) return true;
-        return false;
+        return switch (request_status.classify(self.status)) {
+            .pending, .approval, .unknown => true,
+            .succeeded, .failed => false,
+        };
     }
 
     /// True for statuses that wait on a human approver.
     pub fn awaitsApproval(status: []const u8) bool {
-        return std.mem.startsWith(u8, status, "PendingApproval") or std.mem.eql(u8, status, "PendingAdminDecision");
+        return request_status.classify(status) == .approval;
     }
 };
 

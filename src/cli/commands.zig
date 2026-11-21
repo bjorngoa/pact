@@ -14,6 +14,7 @@ const alerts_service = @import("../app/alerts_service.zig");
 const herdr = @import("../adapters/herdr.zig");
 const messages = @import("../present/messages.zig");
 const errors = @import("../present/errors.zig");
+const background_job = @import("../app/background_job.zig");
 
 const Row = rows_mod.Row;
 const Diagnostics = session_mod.Diagnostics;
@@ -74,7 +75,6 @@ pub const help_text =
 
 /// Interactive commands use the cache only briefly so they act on current state.
 const interactive_max_age_s = 60;
-const settle_timeout_s = 120;
 
 pub const Context = struct {
     session: *session_mod.Session,
@@ -98,7 +98,10 @@ pub const Error = errors.Error;
 pub const reportError = errors.report;
 
 pub fn list(ctx: Context, opts: args.List, diag: *Diagnostics) Error!void {
-    const result = try service.get(ctx.session, ctx.arena(), ctx.now, policyFor(opts.cache, interactive_max_age_s, false), diag);
+    const reconciled = try reconcilePending(ctx, opts.cache, diag);
+    var policy = policyFor(opts.cache, interactive_max_age_s, false);
+    if (reconciled) policy.force = true;
+    const result = try service.get(ctx.session, ctx.arena(), ctx.now, policy, diag);
     const all = try rows_mod.build(ctx.arena(), result.snapshot, ctx.now);
 
     var selected: std.ArrayList(Row) = .empty;
@@ -115,16 +118,41 @@ pub fn list(ctx: Context, opts: args.List, diag: *Diagnostics) Error!void {
 }
 
 pub fn status(ctx: Context, opts: args.Status, diag: *Diagnostics) Error!void {
-    const result = try service.get(ctx.session, ctx.arena(), ctx.now, policyFor(opts.cache, opts.max_age_s, true), diag);
+    const reconciled = try reconcilePending(ctx, opts.cache, diag);
+    var policy = policyFor(opts.cache, opts.max_age_s, true);
+    if (reconciled) policy.force = true;
+    const result = try service.get(ctx.session, ctx.arena(), ctx.now, policy, diag);
     const rows = try rows_mod.build(ctx.arena(), result.snapshot, ctx.now);
     var buf: [64]u8 = undefined;
     const line = status_mod.formatLine(status_mod.summarize(rows), ctx.now, &buf);
     if (line.len > 0) try ctx.stdout.print("{s}\n", .{line});
     if (opts.notify) {
-        const env = ctx.session.env;
+        var env = ctx.session.env;
+        env.state_dir = try ctx.session.cacheDir(ctx.arena(), diag);
         alerts_service.process(ctx.arena(), env, herdr.Notifier.fromEnv(env.environ), rows, ctx.now) catch |err|
             std.log.warn("cannot process notifications: {t}", .{err});
     }
+}
+
+fn reconcilePending(ctx: Context, cache: args.CachePolicy, diag: *Diagnostics) Error!bool {
+    if (cache == .cached) return false;
+    const jobs = background_job.loadFor(ctx.session, ctx.arena()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.IdentityChanged => return error.IdentityChanged,
+        else => return false,
+    };
+    if (!background_job.needsReconcile(jobs, ctx.now) and cache != .refresh) return false;
+    const result = if (cache == .refresh)
+        background_job.reconcileNow(ctx.session, ctx.arena(), diag)
+    else
+        background_job.reconcile(ctx.session, ctx.arena(), diag);
+    result catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        error.IdentityChanged => return error.IdentityChanged,
+        else => std.log.warn("could not reconcile pending requests: {t}", .{err}),
+    };
+    return true;
 }
 
 pub fn up(ctx: Context, opts: args.Up, diag: *Diagnostics) Error!void {
@@ -141,8 +169,7 @@ pub fn up(ctx: Context, opts: args.Up, diag: *Diagnostics) Error!void {
     }
     try ctx.stderr.flush();
 
-    const submissions = try activation.activate(ctx.session, ctx.arena(), plans, justification, ctx.clock(), diag);
-    try finish(ctx, submissions, .activate, opts.wait, diag);
+    try runOperation(ctx, targets, .activate, opts.duration_min, justification, opts.wait);
 }
 
 pub fn down(ctx: Context, opts: args.Down, diag: *Diagnostics) Error!void {
@@ -150,8 +177,7 @@ pub fn down(ctx: Context, opts: args.Down, diag: *Diagnostics) Error!void {
     for (targets) |row| try ctx.stderr.print("Deactivating {s}\n", .{try label(ctx, row)});
     try ctx.stderr.flush();
 
-    const submissions = try activation.deactivate(ctx.session, ctx.arena(), targets, diag);
-    try finish(ctx, submissions, .deactivate, opts.wait, diag);
+    try runOperation(ctx, targets, .deactivate, 0, "", opts.wait);
 }
 
 /// Selects rows to act on, refetching once when cached data finds nothing.
@@ -200,36 +226,22 @@ fn resolveJustification(ctx: Context, given: ?[]const u8, plans: []const activat
     return ctx.arena().dupe(u8, text);
 }
 
-fn finish(ctx: Context, submissions: []const activation.Submission, intent: selection.Intent, wait: bool, diag: *Diagnostics) Error!void {
-    const any_settling = for (submissions) |s| {
-        if (s.settlesAutomatically()) break true;
-    } else false;
-
-    var settled = true;
-    if (wait and any_settling) {
-        try ctx.stderr.writeAll("Waiting for Azure to apply the change...\n");
-        try ctx.stderr.flush();
-        settled = activation.awaitSettled(ctx.session, ctx.arena(), submissions, intent, settle_timeout_s, diag) catch |err| blk: {
-            try ctx.stderr.print("pim: stopped waiting ({t}).\n", .{err});
-            break :blk false;
-        };
-    }
-
-    // Refresh so `pim ls` and status bars reflect the change immediately.
-    const now = ctx.clock();
-    const rows: []const Row = if (service.refresh(ctx.session, ctx.arena(), now, diag)) |snapshot|
-        try rows_mod.build(ctx.arena(), snapshot, now)
-    else |err| blk: {
-        try ctx.stderr.print("pim: could not refresh role state ({t}).\n", .{err});
-        break :blk &.{};
+fn runOperation(ctx: Context, targets: []const Row, intent: selection.Intent, duration_min: u32, justification: []const u8, wait: bool) Error!void {
+    const job = background_job.foreground(ctx.session, ctx.arena(), intent, targets, duration_min, justification, wait) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OperationInProgress => return error.OperationInProgress,
+        error.IdentityChanged => return error.IdentityChanged,
+        else => return error.JobStorageFailed,
     };
-
     var failed = false;
-    for (submissions) |s| {
-        try writeOutcome(ctx, try messages.describeOutcome(ctx.arena(), s, intent, messages.findRow(rows, s.row), now));
-        if (s.outcome == .failed) failed = true;
+    for (job.lines) |line| {
+        try writeOutcome(ctx, line);
+        if (line.kind == .failed) failed = true;
     }
-    if (!settled and wait) try ctx.stderr.writeAll("Azure is still applying some changes; check `pim ls` shortly.\n");
+    if (job.failure) |failure| {
+        try ctx.stderr.print("pim: {s}\n", .{failure});
+        failed = true;
+    }
     if (failed) return error.PartialFailure;
 }
 

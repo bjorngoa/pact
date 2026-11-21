@@ -7,6 +7,7 @@ const time = @import("../domain/time.zig");
 const activation = @import("../app/activation.zig");
 const alerts = @import("../domain/alerts.zig");
 const text = @import("text.zig");
+const request_status = @import("../domain/request_status.zig");
 
 const Row = rows_mod.Row;
 
@@ -44,6 +45,11 @@ pub fn describeOutcome(
             .text = try std.fmt.allocPrint(arena, "{s}: {s}", .{ name, try describeFailure(arena, f) }),
         },
         .accepted => |azure_status| {
+            if (request_status.classify(azure_status) == .failed) return .{
+                .kind = .failed,
+                .glyph = "✗",
+                .text = try std.fmt.allocPrint(arena, "{s}: request {s}", .{ name, try text.sanitize(arena, azure_status) }),
+            };
             if (role.Request.awaitsApproval(azure_status)) return .{
                 .kind = .pending,
                 .glyph = "◐",
@@ -85,7 +91,7 @@ pub fn describeFailure(arena: std.mem.Allocator, f: activation.Failure) std.mem.
         .{ "RoleAssignmentExists", "already active" },
         .{ "RoleAssignmentDoesNotExist", "not active" },
         .{ "ActiveDurationTooShort", "Azure only allows deactivation 5 minutes after activation" },
-        .{ "RoleAssignmentRequestAcrsValidationFailed", "needs a stronger sign-in (MFA / Conditional Access); run `az logout`, `az login`, then retry" },
+        .{ "RoleAssignmentRequestAcrsValidationFailed", "requires additional Conditional Access authentication; complete activation in the Azure portal" },
     };
     for (known) |k| if (std.mem.eql(u8, code, k[0])) return k[1];
     if (std.mem.eql(u8, code, "RoleAssignmentRequestPolicyValidationFailed"))
@@ -150,6 +156,18 @@ test "describeOutcome reflects the refreshed state" {
 
     const approval: activation.Submission = .{ .row = testRow("/a", .eligible, null), .outcome = .{ .accepted = "PendingApproval" } };
     try testing.expectEqualStrings("Owner on rg (Sub): awaiting approval", (try describeOutcome(arena, approval, .activate, null, 0)).text);
+}
+
+test "terminal Azure failures take precedence over observed role state" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const row = testRow("/a", .eligible, null);
+    for ([_][]const u8{ "Failed", "Denied", "TimedOut", "Canceled", "Invalid" }) |status| {
+        const submission: activation.Submission = .{ .row = row, .outcome = .{ .accepted = status } };
+        try testing.expectEqual(Kind.failed, (try describeOutcome(arena.allocator(), submission, .deactivate, row, 0)).kind);
+        try testing.expectEqual(Kind.failed, (try describeOutcome(arena.allocator(), submission, .activate, null, 0)).kind);
+        try testing.expect(!submission.settlesAutomatically());
+    }
 }
 
 test "describeFailure translates known ARM codes" {

@@ -10,6 +10,7 @@ const azcli = @import("../adapters/azcli.zig");
 const arm = @import("../adapters/arm/client.zig");
 const dto = @import("../adapters/arm/dto.zig");
 const session_mod = @import("session.zig");
+const request_status = @import("../domain/request_status.zig");
 
 const Row = rows_mod.Row;
 const Session = session_mod.Session;
@@ -54,7 +55,7 @@ pub const Submission = struct {
     /// Accepted and expected to take effect without a human approver.
     pub fn settlesAutomatically(self: Submission) bool {
         return switch (self.outcome) {
-            .accepted => |status| !role.Request.awaitsApproval(status),
+            .accepted => |status| request_status.classify(status) == .pending or request_status.classify(status) == .succeeded,
             .failed => false,
         };
     }
@@ -90,6 +91,10 @@ fn loadPolicy(client: *const arm.Client, arena: std.mem.Allocator, p: *Plan, req
 }
 
 pub fn activate(session: *Session, arena: std.mem.Allocator, plans: []const Plan, justification: []const u8, now: i64, diag: *Diagnostics) Error![]Submission {
+    return activateWithIds(session, arena, plans, justification, now, &.{}, diag);
+}
+
+pub fn activateWithIds(session: *Session, arena: std.mem.Allocator, plans: []const Plan, justification: []const u8, now: i64, ids: []const []const u8, diag: *Diagnostics) Error![]Submission {
     const principal_id = try session.principalId(diag);
     const client = try session.client(diag);
     const io = session.env.io;
@@ -100,7 +105,7 @@ pub fn activate(session: *Session, arena: std.mem.Allocator, plans: []const Plan
     const submissions = try arena.alloc(Submission, plans.len);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    for (plans, submissions) |p, *s| {
+    for (plans, submissions, 0..) |p, *s, i| {
         s.* = .{ .row = p.row, .outcome = .{ .failed = .{ .reason = .transport } } };
         if (p.policy) |pol| {
             if (pol.ticket_required) {
@@ -121,6 +126,7 @@ pub fn activate(session: *Session, arena: std.mem.Allocator, plans: []const Plan
             .justification = justification,
             .start = start,
             .duration_iso = duration.formatIso(p.duration.minutes, iso),
+            .request_id = if (ids.len > 0) ids[i] else null,
         } });
     }
     try group.await(io);
@@ -128,6 +134,10 @@ pub fn activate(session: *Session, arena: std.mem.Allocator, plans: []const Plan
 }
 
 pub fn deactivate(session: *Session, arena: std.mem.Allocator, rows: []const Row, diag: *Diagnostics) Error![]Submission {
+    return deactivateWithIds(session, arena, rows, &.{}, diag);
+}
+
+pub fn deactivateWithIds(session: *Session, arena: std.mem.Allocator, rows: []const Row, ids: []const []const u8, diag: *Diagnostics) Error![]Submission {
     const principal_id = try session.principalId(diag);
     const client = try session.client(diag);
     const io = session.env.io;
@@ -135,13 +145,14 @@ pub fn deactivate(session: *Session, arena: std.mem.Allocator, rows: []const Row
     const submissions = try arena.alloc(Submission, rows.len);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    for (rows, submissions) |row, *s| {
+    for (rows, submissions, 0..) |row, *s, i| {
         s.* = .{ .row = row, .outcome = .{ .failed = .{ .reason = .transport } } };
         group.async(io, submitOne, .{ &client, arena, io, s, dto.ScheduleRequest{
             .principal_id = principal_id,
             .role_definition_id = row.eligibility.role_definition_id,
             .eligibility_schedule_id = row.eligibility.schedule_id,
             .request_type = .SelfDeactivate,
+            .request_id = if (ids.len > 0) ids[i] else null,
         } });
     }
     try group.await(io);

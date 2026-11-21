@@ -86,6 +86,7 @@ const App = struct {
     policies_batch: ?*Batch = null,
     job_batch: ?*Batch = null,
     jobs_refresh_pending: bool = false,
+    jobs_dirty: bool = false,
     retired: std.ArrayList(*Batch) = .empty,
 
     fn deinit(app: *App) void {
@@ -116,7 +117,13 @@ const App = struct {
     /// Starts a task; returns false (and tells the user) if that failed, in
     /// which case the caller still owns the arguments.
     fn spawn(app: *App, m: *Model, comptime function: anytype, args: anytype) bool {
-        app.group.concurrent(app.io, function, args) catch {
+        const batch = Batch.create(app.gpa) catch {
+            m.refreshing = false;
+            m.setNotice(.failed, "Not enough memory to start a background task.");
+            return false;
+        };
+        app.group.concurrent(app.io, function, args ++ .{batch}) catch {
+            batch.release(app.gpa);
             m.refreshing = false;
             m.setNotice(.failed, "Could not start a background task.");
             return false;
@@ -139,7 +146,9 @@ const App = struct {
                 app.login_group.cancel(app.io);
                 m.refreshing = false;
                 m.setNotice(.info, "Sign-in cancelled. No roles were retried.");
+                app.acknowledgeRetries();
             },
+            .dismiss_sign_in => app.acknowledgeRetries(),
             .activate => |job| {
                 app.startOperation(m, .activate, job.targets, job.duration_min, job.justification);
                 app.gpa.free(job.targets);
@@ -194,6 +203,7 @@ const App = struct {
                     try app.adoptRows(m, b);
                     app.jobs_refresh_pending = false;
                     m.signInComplete();
+                    app.acknowledgeRetries();
                 }
             },
             else => unreachable,
@@ -205,8 +215,21 @@ const App = struct {
         app.generation +%= 1;
         app.login_group.cancel(app.io);
         m.refreshing = false;
-        app.login_group.concurrent(app.io, loginTask, .{ app, app.login_generation, method }) catch
+        const batch = Batch.create(app.gpa) catch {
+            m.signInFailed("Not enough memory to start Azure sign-in.");
+            return;
+        };
+        app.login_group.concurrent(app.io, loginTask, .{ app, app.login_generation, method, batch }) catch {
+            batch.release(app.gpa);
             m.signInFailed("Could not start Azure sign-in. Press enter to try again.");
+        };
+    }
+
+    fn acknowledgeRetries(app: *App) void {
+        if (app.job_batch == null) return;
+        var arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer arena.deinit();
+        background_job.acknowledgeRetries(app.session, arena.allocator()) catch {};
     }
 
     fn startOperation(app: *App, m: *Model, intent: selection.Intent, targets: []const Row, duration_min: u32, justification: []const u8) void {
@@ -220,8 +243,14 @@ const App = struct {
             };
             m.setNotice(.failed, if (err == error.OperationInProgress)
                 "One of these roles is already being processed. No duplicate requests were submitted."
+            else if (err == error.IdentityChanged)
+                "Azure identity changed. Reopen the picker before submitting requests."
             else
                 "Could not start the background operation; no requests were submitted.");
+            if (err == error.AzCliFailed and m.sign_in_enabled) {
+                m.rememberRetry(targets, intent, duration_min) catch {};
+                m.requireSignIn() catch {};
+            }
             return;
         };
         // Cancellation stops waiting, not the independent worker.
@@ -236,19 +265,31 @@ const App = struct {
 
     fn syncJobs(app: *App, m: *Model, force: bool) !void {
         const b = try Batch.create(app.gpa);
-        errdefer b.release(app.gpa);
-        b.jobs = try background_job.loadAll(b.allocator(), app.session.env);
+        errdefer if (app.job_batch != b) b.release(app.gpa);
+        b.jobs = try background_job.loadFor(app.session, b.allocator());
+        if (background_job.needsReconcile(b.jobs, app.now())) app.jobs_refresh_pending = true;
         const previous = if (app.job_batch) |old| old.jobs else &.{};
-        if (!force and sameJobStates(previous, b.jobs)) {
+        if (!force and !app.jobs_dirty and sameJobStates(previous, b.jobs)) {
             b.release(app.gpa);
             app.refreshJobs(m);
             return;
         }
+        try app.adoptJobs(m, b);
+        app.refreshJobs(m);
+    }
+
+    fn adoptJobs(app: *App, m: *Model, b: *Batch) !void {
         try app.retired.ensureUnusedCapacity(app.gpa, 1);
-        try app.applyJobs(m, b);
+        app.applyJobs(m, b) catch |err| {
+            // Model fields may already borrow from b. Retain ownership on error.
+            if (app.job_batch) |old| app.retired.appendAssumeCapacity(old);
+            app.job_batch = b;
+            app.jobs_dirty = true;
+            return err;
+        };
+        app.jobs_dirty = false;
         if (app.job_batch) |old| app.retired.appendAssumeCapacity(old);
         app.job_batch = b;
-        app.refreshJobs(m);
     }
 
     fn applyJobs(app: *App, m: *Model, b: *Batch) !void {
@@ -259,9 +300,11 @@ const App = struct {
         var label: ?[]const u8 = null;
         var since: i64 = 0;
         var new_auth_failure = false;
+        var workers_running = false;
         const was_running = m.busy != null;
         for (b.jobs) |job| {
-            if (!job.done) {
+            if (!job.done) workers_running = true;
+            if (background_job.blocks(job)) {
                 if (working.items.len == 0) since = job.started_at;
                 const action: []const u8 = if (job.intent == .activate) "Activating" else "Deactivating";
                 label = if (label == null or std.mem.eql(u8, label.?, action)) action else "Processing";
@@ -273,7 +316,7 @@ const App = struct {
             } else true;
             if (newly_done) {
                 app.jobs_refresh_pending = true;
-                if (job.authentication_required) new_auth_failure = true;
+                if (job.retry_pending) new_auth_failure = true;
             }
             try lines.appendSlice(arena, job.lines);
             if (job.failure) |failure|
@@ -281,10 +324,11 @@ const App = struct {
         }
         // All running workers remain represented when one finishes or a new one starts.
         try m.setRunning(label orelse "Processing", working.items, since);
+        m.workers_running = workers_running;
         m.results = lines.items;
         if (new_auth_failure and m.sign_in_enabled and (was_running or m.authentication_required))
             m.authentication_required = true;
-        if (m.busy == null and m.authentication_required and m.sign_in_enabled)
+        if (!m.workers_running and m.authentication_required and m.sign_in_enabled)
             try offerSignInForJobs(m, b.jobs);
     }
 
@@ -312,7 +356,8 @@ const App = struct {
 
     /// Frees retired batches once nothing can still point into them.
     fn collect(app: *App, m: *const Model) void {
-        if (app.inflight > 0 or m.mode != .browse or m.busy != null) return;
+        if (app.inflight > 0 or m.mode != .browse or app.jobs_dirty or
+            (m.busy != null and !m.working_from_jobs)) return;
         if (app.policies_batch) |b| {
             app.policies_batch = null;
             b.release(app.gpa);
@@ -324,19 +369,14 @@ const App = struct {
 
 fn offerSignInForJobs(m: *Model, jobs: []const background_job.Job) !void {
     // Keep an actively edited form's retry selection, otherwise recover failed batches.
-    if (m.sign_in_enabled and m.busy == null and m.mode == .browse and !m.authentication_prompted) {
+    if (m.sign_in_enabled and !m.workers_running and m.mode == .browse and !m.authentication_prompted) {
         var latest: ?background_job.Job = null;
         for (jobs) |job| {
-            if (job.done and job.authentication_required) latest = job;
+            if (job.done and job.retry_pending) latest = job;
         }
         if (latest) |job| {
-            var targets: std.ArrayList(Row) = .empty;
-            defer targets.deinit(m.gpa);
-            for (jobs) |failed| {
-                if (failed.done and failed.authentication_required and failed.intent == job.intent)
-                    try targets.appendSlice(m.gpa, failed.targets);
-            }
-            try m.rememberRetry(targets.items, job.intent, job.duration_min);
+            // Independent batches can have different durations and user intent.
+            try m.rememberRetry(job.targets, job.intent, job.duration_min);
         }
     }
     try m.requireSignIn();
@@ -345,19 +385,23 @@ fn offerSignInForJobs(m: *Model, jobs: []const background_job.Job) !void {
 fn sameJobStates(a: []const background_job.Job, b: []const background_job.Job) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right|
-        if (!std.mem.eql(u8, left.id, right.id) or left.done != right.done) return false;
+        if (!std.mem.eql(u8, left.id, right.id) or left.done != right.done or left.revision != right.revision) return false;
     return true;
 }
 
 // ---- background tasks --------------------------------------------------------
 
-fn refreshTask(app: *App, generation: u64) void {
-    const b = Batch.create(app.gpa) catch return;
+fn refreshTask(app: *App, generation: u64, b: *Batch) void {
     b.generation = generation;
     var diag: session_mod.Diagnostics = .{};
     loadRows(app, b, &diag) catch |err| {
         b.authentication_required = errors.needsSignIn(err, diag);
         b.failure = errors.summaryAlloc(b.allocator(), err, diag) catch "Refresh failed";
+    };
+    if (b.failure == null) background_job.reconcile(app.session, b.allocator(), &diag) catch |err| {
+        if (err == error.Canceled) {
+            b.failure = "Refresh cancelled.";
+        } else std.log.warn("could not reconcile Azure requests: {t}", .{err});
     };
     app.post(.{ .rows_loaded = b });
 }
@@ -369,9 +413,8 @@ fn loadRows(app: *App, b: *Batch, diag: *session_mod.Diagnostics) errors.Error!v
     b.fetched_at = snapshot.fetched_at;
 }
 
-fn policiesTask(app: *App, targets: []Row, requested_min: u32, generation: u64) void {
+fn policiesTask(app: *App, targets: []Row, requested_min: u32, generation: u64, b: *Batch) void {
     defer app.gpa.free(targets);
-    const b = Batch.create(app.gpa) catch return;
     b.generation = generation;
     var diag: session_mod.Diagnostics = .{};
     b.plans = activation.plan(app.session, b.allocator(), targets, requested_min, &diag) catch |err| blk: {
@@ -392,8 +435,7 @@ const LoginProgress = struct {
     }
 };
 
-fn loginTask(app: *App, generation: u64, method: azure_login.Method) void {
-    const b = Batch.create(app.gpa) catch return;
+fn loginTask(app: *App, generation: u64, method: azure_login.Method, b: *Batch) void {
     b.generation = generation;
     var progress: LoginProgress = .{ .app = app, .generation = generation };
     const env = app.session.env;
@@ -473,7 +515,7 @@ pub fn run(gpa: Allocator, io: std.Io, environ: *std.process.Environ.Map, sessio
     }
     model.refreshing = true;
     _ = app.spawn(&model, refreshTask, .{ &app, app.generation });
-    try app.syncJob(&model);
+    app.syncJob(&model) catch model.setNotice(.info, "Job history unavailable until Azure sign-in is restored.");
     app.group.concurrent(io, tickTask, .{&app}) catch {};
 
     var frame: std.heap.ArenaAllocator = .init(gpa);
@@ -652,6 +694,7 @@ test "parallel authentication failures wait for workers then preserve all failed
     failed_a.done = true;
     failed_a.failure = "sign in";
     failed_a.authentication_required = true;
+    failed_a.retry_pending = true;
     const second = try Batch.create(testing.allocator);
     defer second.release(testing.allocator);
     second.jobs = &.{ failed_a, first.jobs[1] };
@@ -664,12 +707,70 @@ test "parallel authentication failures wait for workers then preserve all failed
     failed_b.done = true;
     failed_b.failure = "sign in";
     failed_b.authentication_required = true;
+    failed_b.retry_pending = true;
     const final = try Batch.create(testing.allocator);
     defer final.release(testing.allocator);
     final.jobs = &.{ failed_a, failed_b };
     try app.applyJobs(&model, final);
     try testing.expectEqual(model_mod.Mode.sign_in, model.mode);
-    try testing.expectEqual(@as(usize, 2), model.selected.count());
+    try testing.expectEqual(@as(usize, 1), model.selected.count());
     try testing.expect(model.busy == null);
     try testing.expectEqual(@as(?u32, 90), model.retry_duration_min);
+}
+
+test "allocation failure after publishing job results retains the backing batch" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    const gpa = failing.allocator();
+    var model: Model = .init(gpa, 480);
+    defer model.deinit();
+    model.sign_in_enabled = true;
+    model.authentication_required = true;
+    var app: App = .{ .gpa = gpa, .io = testing.io, .session = undefined, .loop = undefined };
+    const batch = try Batch.create(testing.allocator);
+    defer {
+        batch.release(gpa);
+        app.retired.deinit(gpa);
+    }
+    batch.jobs = &.{.{
+        .id = "failed",
+        .intent = .activate,
+        .targets = &.{.{
+            .eligibility = .{ .schedule_id = "one", .scope = "/s", .scope_name = "s", .role_definition_id = "owner", .role_name = "Owner" },
+            .subscription_name = "Sub",
+            .state = .eligible,
+        }},
+        .duration_min = 60,
+        .started_at = 1,
+        .done = true,
+        .authentication_required = true,
+        .retry_pending = true,
+        .failure = "sign in",
+    }};
+    try testing.expectError(error.OutOfMemory, app.adoptJobs(&model, batch));
+    try testing.expect(app.job_batch == batch and app.jobs_dirty);
+    try testing.expectEqual(messages.Kind.failed, model.results[0].kind);
+    try testing.expectEqualStrings("sign in", model.results[0].text);
+}
+
+test "historical authentication failures are excluded and retry keeps one batch duration" {
+    const testing = std.testing;
+    var model: Model = .init(testing.allocator, 480);
+    defer model.deinit();
+    model.sign_in_enabled = true;
+    const old: Row = .{
+        .eligibility = .{ .schedule_id = "old", .scope = "/old", .scope_name = "old", .role_definition_id = "owner", .role_name = "Owner" },
+        .subscription_name = "Sub",
+        .state = .eligible,
+    };
+    var current = old;
+    current.eligibility.schedule_id = "current";
+    current.eligibility.scope = "/current";
+    const jobs: []const background_job.Job = &.{
+        .{ .id = "historical", .intent = .activate, .targets = &.{old}, .duration_min = 480, .started_at = 1, .done = true, .authentication_required = true },
+        .{ .id = "current", .intent = .activate, .targets = &.{current}, .duration_min = 60, .started_at = 2, .done = true, .authentication_required = true, .retry_pending = true },
+    };
+    try offerSignInForJobs(&model, jobs);
+    try testing.expect(!model.isSelected(old) and model.isSelected(current));
+    try testing.expectEqual(@as(?u32, 60), model.retry_duration_min);
 }

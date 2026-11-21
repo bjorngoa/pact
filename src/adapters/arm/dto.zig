@@ -199,6 +199,7 @@ pub fn parsePolicy(arena: std.mem.Allocator, body: []const u8) ParseError!?polic
 pub const RequestType = enum { SelfActivate, SelfDeactivate };
 
 pub const ScheduleRequest = struct {
+    request_id: ?[]const u8 = null,
     principal_id: []const u8,
     role_definition_id: []const u8,
     eligibility_schedule_id: []const u8,

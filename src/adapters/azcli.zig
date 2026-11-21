@@ -9,6 +9,7 @@ pub const Error = error{
     /// `az` exited unsuccessfully (typically not logged in); see `Diagnostics`.
     AzCliFailed,
     InvalidResponse,
+    IdentityChanged,
 } || std.process.RunError || std.mem.Allocator.Error;
 
 pub const Diagnostics = struct {
@@ -20,6 +21,49 @@ pub const Token = struct {
     value: []const u8,
     expires_at: i64,
 };
+
+/// Account metadata is read from the CLI's local profile, without requesting a token.
+pub fn accountKey(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, diag: *Diagnostics) Error![]const u8 {
+    var child_env = try environ.clone(arena);
+    try child_env.put("AZURE_CORE_COLLECT_TELEMETRY", "false");
+    try child_env.put("AZURE_CORE_NO_COLOR", "true");
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ "az", "account", "show", "--output", "json" },
+        .environ_map = &child_env,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(timeout_s), .clock = .awake } },
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.AzCliNotFound,
+        else => return err,
+    };
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        diag.stderr = std.mem.trim(u8, result.stderr, " \r\n");
+        return error.AzCliFailed;
+    }
+    return parseAccountKey(arena, result.stdout);
+}
+
+fn parseAccountKey(arena: std.mem.Allocator, bytes: []const u8) Error![]const u8 {
+    const Account = struct {
+        tenantId: []const u8,
+        environmentName: []const u8,
+        user: struct { name: []const u8, type: []const u8 },
+    };
+    const account = std.json.parseFromSliceLeaky(Account, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidResponse;
+    if (account.tenantId.len == 0 or account.user.name.len == 0 or account.environmentName.len == 0) return error.InvalidResponse;
+    var canonical: std.Io.Writer.Allocating = .init(arena);
+    std.json.Stringify.value(.{ account.environmentName, account.tenantId, account.user.type, account.user.name }, .{}, &canonical.writer) catch return error.OutOfMemory;
+    const lowered = try std.ascii.allocLowerString(arena, canonical.written());
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(lowered, &hash, .{});
+    return arena.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
+}
 
 const timeout_s = 30;
 
@@ -105,6 +149,17 @@ test "parseToken reads token and epoch expiry" {
     );
     try testing.expectEqualStrings("abc", token.value);
     try testing.expectEqual(@as(i64, 1791057600), token.expires_at);
+}
+
+test "account namespace changes with tenant or identity but not casing or subscription" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const first = try parseAccountKey(arena, "{\"tenantId\":\"tenant\",\"environmentName\":\"AzureCloud\",\"user\":{\"name\":\"one@example.test\",\"type\":\"user\"}}");
+    const same = try parseAccountKey(arena, "{\"id\":\"another-subscription\",\"tenantId\":\"TENANT\",\"environmentName\":\"AzureCloud\",\"user\":{\"name\":\"ONE@example.test\",\"type\":\"user\"}}");
+    const other = try parseAccountKey(arena, "{\"tenantId\":\"tenant\",\"environmentName\":\"AzureCloud\",\"user\":{\"name\":\"two@example.test\",\"type\":\"user\"}}");
+    try testing.expectEqualStrings(first, same);
+    try testing.expect(!std.mem.eql(u8, first, other));
 }
 
 test "parseToken rejects incomplete output" {

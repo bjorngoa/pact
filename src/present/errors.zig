@@ -12,12 +12,16 @@ pub const Error = service.GetError || activation.Error || std.Io.Writer.Error ||
     /// Some requests failed; details were already shown.
     PartialFailure,
     JustificationRequired,
+    OperationInProgress,
+    JobStorageFailed,
 };
 
 pub fn needsSignIn(err: Error, diag: session_mod.Diagnostics) bool {
     if (err == error.HttpFailed) {
+        if (std.mem.eql(u8, diag.arm.code, "RoleAssignmentRequestAcrsValidationFailed") or
+            std.ascii.indexOfIgnoreCase(diag.arm.claims_challenge, "claims=") != null) return false;
         if (diag.arm.status == .unauthorized) return true;
-        for ([_][]const u8{ "RoleAssignmentRequestAcrsValidationFailed", "ExpiredAuthenticationToken", "InvalidAuthenticationToken", "AuthenticationFailed" }) |code|
+        for ([_][]const u8{ "ExpiredAuthenticationToken", "InvalidAuthenticationToken", "AuthenticationFailed" }) |code|
             if (std.mem.eql(u8, diag.arm.code, code)) return true;
     }
     if (err != error.AzCliFailed) return false;
@@ -30,6 +34,9 @@ pub fn report(w: *std.Io.Writer, err: Error, diag: session_mod.Diagnostics) std.
     switch (err) {
         error.NothingSelected, error.PartialFailure, error.WriteFailed => {},
         error.JustificationRequired => try w.writeAll("pim: this role requires a justification. Pass -j \"reason\".\n"),
+        error.IdentityChanged => try w.writeAll("pim: Azure account or tenant changed. Reopen the picker or rerun the command before submitting requests.\n"),
+        error.OperationInProgress => try w.writeAll("pim: a request for this role is already running or unresolved in Azure. Refresh before retrying.\n"),
+        error.JobStorageFailed => try w.writeAll("pim: could not safely persist operation state. Some requests may have reached Azure; refresh before retrying.\n"),
         error.AzCliNotFound => try w.writeAll(
             \\pim: the Azure CLI (az) was not found on PATH.
             \\     Install it from https://aka.ms/azure-cli, then run `az login`.
@@ -57,7 +64,11 @@ pub fn report(w: *std.Io.Writer, err: Error, diag: session_mod.Diagnostics) std.
                 try text.writeSanitized(w, diag.arm.message);
             }
             try w.writeByte('\n');
-            if (code == 401) try w.writeAll("     Your session may have expired. Run `az login`.\n");
+            if (std.mem.eql(u8, diag.arm.code, "RoleAssignmentRequestAcrsValidationFailed") or diag.arm.claims_challenge.len > 0) {
+                try w.writeAll("     Additional authentication claims may be required. Complete activation in the Azure portal.\n");
+            } else if (code == 401) try w.writeAll("     Your session may have expired. Run `az login`.\n");
+            if (diag.arm.retry_after_seconds) |seconds|
+                try w.print("     Azure requested a wait of {d} seconds before retrying.\n", .{seconds});
         },
         error.InvalidResponse => try w.writeAll("pim: unexpected response from Azure.\n"),
         error.UntrustedNextLink => try w.writeAll("pim: refused to follow a pagination link outside management.azure.com.\n"),
@@ -133,7 +144,8 @@ test "only authentication failures offer sign-in" {
     try testing.expect(needsSignIn(error.AzCliFailed, .{ .az = .{ .stderr = "ERROR: Please run 'az login'." } }));
     try testing.expect(needsSignIn(error.AzCliFailed, .{ .az = .{ .stderr = "AADSTS700082: expired refresh token" } }));
     try testing.expect(needsSignIn(error.HttpFailed, .{ .arm = .{ .status = .unauthorized } }));
-    try testing.expect(needsSignIn(error.HttpFailed, .{ .arm = .{ .status = .forbidden, .code = "RoleAssignmentRequestAcrsValidationFailed" } }));
+    try testing.expect(!needsSignIn(error.HttpFailed, .{ .arm = .{ .status = .forbidden, .code = "RoleAssignmentRequestAcrsValidationFailed" } }));
+    try testing.expect(!needsSignIn(error.HttpFailed, .{ .arm = .{ .status = .unauthorized, .claims_challenge = "Bearer claims=\"encoded\"" } }));
     try testing.expect(!needsSignIn(error.HttpFailed, .{ .arm = .{ .status = .forbidden, .code = "AuthorizationFailed" } }));
     try testing.expect(!needsSignIn(error.AzCliFailed, .{ .az = .{ .stderr = "Invalid CLI configuration" } }));
     try testing.expect(!needsSignIn(error.TimedOut, .{}));

@@ -11,6 +11,8 @@ const activation = @import("activation.zig");
 const service = @import("snapshot_service.zig");
 const messages = @import("../present/messages.zig");
 const errors = @import("../present/errors.zig");
+const arm = @import("../adapters/arm/client.zig");
+const request_status = @import("../domain/request_status.zig");
 
 pub const worker_command = "__background-worker";
 const file_name = "operation.json";
@@ -34,24 +36,69 @@ pub const Job = struct {
     lines: []const messages.Line = &.{},
     failure: ?[]const u8 = null,
     authentication_required: bool = false,
+    retry_pending: bool = false,
+    owner_key: ?[]const u8 = null,
+    principal_id: ?[]const u8 = null,
+    requests: []TrackedRequest = &.{},
+    revision: u32 = 0,
+    finished_at: i64 = 0,
+    reconciled_at: i64 = 0,
+    legacy_resolved: bool = false,
+    legacy_unresolved: bool = false,
     /// Cleared by the worker before it contacts Azure.
     justification: ?[]const u8 = null,
 };
 
-/// Caller must reap the child, but must never kill it when the picker closes.
-pub fn start(session: *session_mod.Session, arena: std.mem.Allocator, intent: selection.Intent, targets: []const rows_mod.Row, duration_min: u32, justification: []const u8) !std.process.Child {
-    const env = session.env;
-    const now = std.Io.Clock.real.now(env.io);
+pub const TrackedRequest = struct {
+    id: []const u8,
+    row: rows_mod.Row,
+    attempted: bool = false,
+    state: request_status.State = .unknown,
+    azure_status: []const u8 = "",
+
+    fn unresolved(request: TrackedRequest) bool {
+        return request.attempted and request.state != .succeeded and request.state != .failed;
+    }
+};
+
+pub fn blocks(job: Job) bool {
+    if (!job.done) return true;
+    if (job.legacy_unresolved and !job.legacy_resolved) return true;
+    for (job.requests) |request| if (request.unresolved()) return true;
+    if (job.requests.len == 0 and !job.legacy_resolved) {
+        for (job.lines) |line| if (line.kind == .pending) return true;
+    }
+    return false;
+}
+
+fn createJob(session: *session_mod.Session, arena: std.mem.Allocator, intent: selection.Intent, targets: []const rows_mod.Row, duration_min: u32, justification: []const u8) !Job {
+    var diag: session_mod.Diagnostics = .{};
+    const owner = try session.identityKey(&diag);
+    const principal = try session.principalId(&diag);
     var random: [16]u8 = undefined;
-    try env.io.randomSecure(&random);
-    var job: Job = .{
+    try session.env.io.randomSecure(&random);
+    const requests = try arena.alloc(TrackedRequest, targets.len);
+    for (targets, requests) |row, *request| {
+        const id = try arm.Client.requestId(session.env.io);
+        request.* = .{ .id = try arena.dupe(u8, &id), .row = row };
+    }
+    return .{
         .id = try arena.dupe(u8, &std.fmt.bytesToHex(random, .lower)),
+        .owner_key = owner,
+        .principal_id = principal,
         .intent = intent,
         .targets = targets,
         .duration_min = duration_min,
-        .started_at = now.toSeconds(),
+        .started_at = std.Io.Clock.real.now(session.env.io).toSeconds(),
         .justification = justification,
+        .requests = requests,
     };
+}
+
+/// Caller must reap the child, but must never kill it when the picker closes.
+pub fn start(session: *session_mod.Session, arena: std.mem.Allocator, intent: selection.Intent, targets: []const rows_mod.Row, duration_min: u32, justification: []const u8) !std.process.Child {
+    const env = session.env;
+    var job = try createJob(session, arena, intent, targets, duration_min, justification);
     const exe = try std.process.executablePathAlloc(env.io, arena);
     // Serialize only the reservation, not the Azure operation.
     const registry = try acquireNamed(env.io, env.state_dir, registry_lock_name, false);
@@ -86,7 +133,8 @@ fn reserve(arena: std.mem.Allocator, env: session_mod.Env, job: Job) !Reservatio
     }
     const existing = try loadAllUnlocked(arena, env);
     for (existing) |other| {
-        if (other.done) continue;
+        if (!blocks(other)) continue;
+        if (other.owner_key != null and job.owner_key != null and !std.mem.eql(u8, other.owner_key.?, job.owner_key.?)) continue;
         for (other.targets) |working| {
             for (job.targets) |target|
                 if (rows_mod.sameRole(working, target)) return error.OperationInProgress;
@@ -129,7 +177,125 @@ pub fn load(arena: std.mem.Allocator, env: session_mod.Env) !?Job {
 pub fn loadAll(arena: std.mem.Allocator, env: session_mod.Env) ![]const Job {
     const registry = try acquireNamed(env.io, env.state_dir, registry_lock_name, false);
     defer registry.close(env.io);
-    return loadAllUnlocked(arena, env);
+    const jobs = try loadAllUnlocked(arena, env);
+    try prune(env, jobs);
+    return jobs;
+}
+
+pub fn loadFor(session: *session_mod.Session, arena: std.mem.Allocator) ![]const Job {
+    var diag: session_mod.Diagnostics = .{};
+    const key = session.account_key orelse try session.identityKey(&diag);
+    const all = try loadAll(arena, session.env);
+    var matching: std.ArrayList(Job) = .empty;
+    for (all) |job| {
+        if (job.owner_key) |owner| {
+            if (std.mem.eql(u8, owner, key)) try matching.append(arena, job);
+        }
+    }
+    return matching.toOwnedSlice(arena);
+}
+
+pub fn acknowledgeRetries(session: *session_mod.Session, arena: std.mem.Allocator) !void {
+    const jobs = try loadFor(session, arena);
+    for (jobs) |saved| {
+        if (!saved.done or !saved.retry_pending) continue;
+        const dir = try std.fs.path.join(arena, &.{ session.env.state_dir, jobs_dir_name });
+        const lock = acquireNamed(session.env.io, dir, try jobFile(arena, saved.id, ".lock"), true) catch continue;
+        defer lock.close(session.env.io);
+        const file = try jobFile(arena, saved.id, ".json");
+        var job = store.load(Job, arena, session.env.io, dir, file) orelse continue;
+        job.retry_pending = false;
+        job.revision +%= 1;
+        try store.save(Job, session.env.io, dir, file, job);
+    }
+}
+
+pub fn needsReconcile(jobs: []const Job, now: i64) bool {
+    for (jobs) |job|
+        if (job.done and blocks(job) and now - job.reconciled_at >= 30) return true;
+    return false;
+}
+
+pub fn reconcile(session: *session_mod.Session, arena: std.mem.Allocator, diag: *session_mod.Diagnostics) !void {
+    try reconcileRequests(session, arena, diag, false);
+}
+
+pub fn reconcileNow(session: *session_mod.Session, arena: std.mem.Allocator, diag: *session_mod.Diagnostics) !void {
+    try reconcileRequests(session, arena, diag, true);
+}
+
+fn reconcileRequests(session: *session_mod.Session, arena: std.mem.Allocator, diag: *session_mod.Diagnostics, force: bool) !void {
+    const now = std.Io.Clock.real.now(session.env.io).toSeconds();
+    const jobs = try loadFor(session, arena);
+    for (jobs) |saved| {
+        if (!saved.done or !blocks(saved) or (!force and now - saved.reconciled_at < 30)) continue;
+        const dir = try std.fs.path.join(arena, &.{ session.env.state_dir, jobs_dir_name });
+        const file = try jobFile(arena, saved.id, ".json");
+        const lock = acquireNamed(session.env.io, dir, try jobFile(arena, saved.id, ".lock"), true) catch continue;
+        defer lock.close(session.env.io);
+        var job = store.load(Job, arena, session.env.io, dir, file) orelse continue;
+        if (!job.done) continue;
+        const client = try session.client(diag);
+        var changed = false;
+        for (job.requests) |*request| {
+            if (!request.unresolved()) continue;
+            const status = client.requestStatus(arena, request.row.eligibility.scope, request.id, &diag.arm) catch |err| {
+                if (err == error.Canceled or err == error.OutOfMemory) return err;
+                continue;
+            };
+            const state = request_status.classify(status);
+            if (state != request.state or !std.mem.eql(u8, status, request.azure_status)) changed = true;
+            request.state = state;
+            request.azure_status = status;
+        }
+        job.reconciled_at = now;
+        if (changed) {
+            var lines: std.ArrayList(messages.Line) = .empty;
+            for (job.requests, 0..) |request, i| {
+                if (request.azure_status.len == 0 and i < job.lines.len) {
+                    try lines.append(arena, job.lines[i]);
+                    continue;
+                }
+                var final = request.row;
+                final.state = if (request.state == .succeeded and job.intent == .activate) .active else .eligible;
+                try lines.append(arena, try messages.describeOutcome(arena, .{
+                    .row = request.row,
+                    .outcome = .{ .accepted = if (request.azure_status.len > 0) request.azure_status else "Unknown" },
+                }, job.intent, if (request.state == .succeeded) final else null, now));
+            }
+            job.lines = lines.items;
+            job.revision +%= 1;
+        }
+        try store.save(Job, session.env.io, dir, file, job);
+    }
+}
+
+const retained_history = 20;
+
+fn prune(env: session_mod.Env, jobs: []const Job) !void {
+    var completed: usize = 0;
+    for (jobs) |job| if (job.done and !blocks(job) and !job.retry_pending) {
+        completed += 1;
+    };
+    for (jobs) |job| {
+        if (completed <= retained_history) break;
+        if (!job.done or blocks(job) or job.retry_pending or job.owner_key == null) continue;
+        var arena_state: std.heap.ArenaAllocator = .init(env.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const dir_path = try std.fs.path.join(arena, &.{ env.state_dir, jobs_dir_name });
+        const lock_file = try jobFile(arena, job.id, ".lock");
+        const lock = acquireNamed(env.io, dir_path, lock_file, true) catch continue;
+        var dir = try std.Io.Dir.cwd().openDir(env.io, dir_path, .{});
+        defer dir.close(env.io);
+        dir.deleteFile(env.io, try jobFile(arena, job.id, ".json")) catch {
+            lock.close(env.io);
+            continue;
+        };
+        lock.close(env.io);
+        try dir.deleteFile(env.io, lock_file);
+        completed -= 1;
+    }
 }
 
 fn loadAllUnlocked(arena: std.mem.Allocator, env: session_mod.Env) ![]const Job {
@@ -174,8 +340,10 @@ fn loadOne(arena: std.mem.Allocator, io: std.Io, dir: []const u8, file: []const 
     var job = store.load(Job, arena, io, dir, file) orelse return null;
     if (!job.done) {
         job.done = true;
+        job.legacy_unresolved = job.requests.len == 0;
         job.justification = null;
         job.failure = "The background worker stopped. Some requests may have reached Azure; refresh roles before retrying.";
+        job.revision +%= 1;
         try store.save(Job, io, dir, file, job);
     }
     return job;
@@ -190,32 +358,94 @@ pub fn run(session: *session_mod.Session, id: []const u8) !void {
     const file = if (new_job != null) new_file else file_name;
     var job = new_job orelse store.load(Job, session.arena, env.io, dir, file) orelse return error.NoJob;
     if (job.done or !std.mem.eql(u8, job.id, id)) return error.NoJob;
-    const justification = job.justification orelse "";
-    job.justification = null;
-    try store.save(Job, env.io, dir, file, job);
-
-    var diag: session_mod.Diagnostics = .{};
-    execute(session, &job, justification, &diag) catch |err| {
-        job.authentication_required = errors.needsSignIn(err, diag);
-        job.failure = try errors.summaryAlloc(session.arena, err, diag);
+    // Legacy jobs have no trustworthy account binding and must not be replayed.
+    session.expected_account_key = job.owner_key orelse {
+        job.done = true;
+        job.failure = "This legacy job has no Azure identity binding. Refresh roles and submit it again.";
+        job.justification = null;
+        try store.save(Job, env.io, dir, file, job);
+        return;
     };
-    job.done = true;
-    try store.save(Job, env.io, dir, file, job);
+    session.expected_principal_id = job.principal_id orelse return error.IdentityChanged;
+    try runJob(session, &job, dir, file, true);
     const notification = try describeNotification(session.arena, job);
     herdr.Notifier.fromEnv(env.environ).show(session.arena, env.io, notification.title, notification.body) catch |err|
         std.log.warn("cannot notify about background operation: {t}", .{err});
 }
 
-fn execute(session: *session_mod.Session, job: *Job, justification: []const u8, diag: *session_mod.Diagnostics) errors.Error!void {
+/// Foreground and popup operations share reservations, persistence and execution.
+pub fn foreground(session: *session_mod.Session, arena: std.mem.Allocator, intent: selection.Intent, targets: []const rows_mod.Row, duration_min: u32, justification: []const u8, wait: bool) !Job {
+    var job = try createJob(session, arena, intent, targets, duration_min, justification);
+    const registry = try acquireNamed(session.env.io, session.env.state_dir, registry_lock_name, false);
+    const reserved = reserve(arena, session.env, job) catch |err| {
+        registry.close(session.env.io);
+        return err;
+    };
+    registry.close(session.env.io);
+    defer reserved.lock.close(session.env.io);
+    try runJob(session, &job, reserved.dir, reserved.file, wait);
+    return job;
+}
+
+fn runJob(session: *session_mod.Session, job: *Job, dir: []const u8, file: []const u8, wait: bool) !void {
+    const env = session.env;
+    const justification = job.justification orelse "";
+    job.justification = null;
+    try store.save(Job, env.io, dir, file, job.*);
+
+    var diag: session_mod.Diagnostics = .{};
+    execute(session, job, justification, dir, file, wait, &diag) catch |err| {
+        job.authentication_required = errors.needsSignIn(err, diag);
+        job.failure = try errors.summaryAlloc(session.arena, err, diag);
+    };
+    job.done = true;
+    job.retry_pending = job.authentication_required and !blocks(job.*);
+    job.finished_at = std.Io.Clock.real.now(env.io).toSeconds();
+    job.revision +%= 1;
+    if (job.retry_pending) {
+        const registry = try acquireNamed(env.io, env.state_dir, registry_lock_name, false);
+        defer registry.close(env.io);
+        const previous = try loadAllUnlocked(session.arena, env);
+        for (previous) |old| {
+            if (!old.done or !old.retry_pending or old.owner_key == null or job.owner_key == null or
+                !std.mem.eql(u8, old.owner_key.?, job.owner_key.?) or std.mem.eql(u8, old.id, job.id)) continue;
+            var superseded = old;
+            superseded.retry_pending = false;
+            superseded.revision +%= 1;
+            const old_dir = try std.fs.path.join(session.arena, &.{ env.state_dir, jobs_dir_name });
+            try store.save(Job, env.io, old_dir, try jobFile(session.arena, old.id, ".json"), superseded);
+        }
+        try store.save(Job, env.io, dir, file, job.*);
+        return;
+    }
+    try store.save(Job, env.io, dir, file, job.*);
+}
+
+fn execute(session: *session_mod.Session, job: *Job, justification: []const u8, dir: []const u8, file: []const u8, wait: bool, diag: *session_mod.Diagnostics) errors.Error!void {
     const arena = session.arena;
     const io = session.env.io;
+    const plans = if (job.intent == .activate) try activation.plan(session, arena, job.targets, job.duration_min, diag) else &.{};
+    _ = try session.client(diag);
+    const ids = try arena.alloc([]const u8, job.requests.len);
+    for (job.requests, ids) |*request, *id| {
+        request.attempted = true;
+        id.* = request.id;
+    }
+    store.save(Job, io, dir, file, job.*) catch return error.JobStorageFailed;
     const submissions = switch (job.intent) {
-        .activate => blk: {
-            const plans = try activation.plan(session, arena, job.targets, job.duration_min, diag);
-            break :blk try activation.activate(session, arena, plans, justification, std.Io.Clock.real.now(io).toSeconds(), diag);
-        },
-        .deactivate => try activation.deactivate(session, arena, job.targets, diag),
+        .activate => try activation.activateWithIds(session, arena, plans, justification, std.Io.Clock.real.now(io).toSeconds(), ids, diag),
+        .deactivate => try activation.deactivateWithIds(session, arena, job.targets, ids, diag),
     };
+    for (submissions, job.requests) |submission, *request| switch (submission.outcome) {
+        .accepted => |status| {
+            request.azure_status = status;
+            request.state = request_status.classify(status);
+        },
+        .failed => |failure| {
+            request.state = failureState(failure);
+        },
+    };
+    store.save(Job, io, dir, file, job.*) catch return error.JobStorageFailed;
     const settling = for (submissions) |s| {
         if (s.settlesAutomatically()) break true;
     } else false;
@@ -223,7 +453,7 @@ fn execute(session: *session_mod.Session, job: *Job, justification: []const u8, 
     var lines: std.ArrayList(messages.Line) = .empty;
     var problems: std.ArrayList(messages.Line) = .empty;
     var still_applying = false;
-    if (settling) {
+    if (settling and wait) {
         if (activation.awaitSettled(session, arena, submissions, job.intent, 120, diag)) |settled| {
             still_applying = !settled;
         } else |err| {
@@ -247,6 +477,20 @@ fn execute(session: *session_mod.Session, job: *Job, justification: []const u8, 
     try lines.appendSlice(arena, problems.items);
     if (still_applying) try lines.append(arena, .{ .kind = .info, .glyph = "...", .text = "Azure is still applying some changes; press ^r to refresh." });
     job.lines = lines.items;
+}
+
+fn failureState(failure: activation.Failure) request_status.State {
+    if (failure.reason == .transport) return .unknown;
+    if (failure.reason != .rejected) return .failed;
+    const status = failure.arm.status orelse return .unknown;
+    return if (status.class() == .client_error and status != .request_timeout) .failed else .unknown;
+}
+
+test "ambiguous server failures remain unresolved while definitive policy rejections do not" {
+    try testing.expectEqual(request_status.State.unknown, failureState(.{ .reason = .transport }));
+    try testing.expectEqual(request_status.State.unknown, failureState(.{ .reason = .rejected, .arm = .{ .status = .service_unavailable } }));
+    try testing.expectEqual(request_status.State.failed, failureState(.{ .reason = .rejected, .arm = .{ .status = .forbidden } }));
+    try testing.expectEqual(request_status.State.failed, failureState(.{ .reason = .ticket_required }));
 }
 
 fn problemLine(arena: std.mem.Allocator, what: []const u8, err: errors.Error, diag: session_mod.Diagnostics) std.mem.Allocator.Error!messages.Line {
@@ -469,4 +713,75 @@ test "completion notifications distinguish failures, pending and success" {
     try testing.expectEqualStrings("PIM activation had failures", (try describeNotification(arena, job)).title);
     job.failure = "not signed in";
     try testing.expectEqualStrings("not signed in", (try describeNotification(arena, job)).body);
+}
+
+test "pending approvals and ambiguous writes retain conflicts after a worker exits" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ: std.process.Environ.Map = .init(arena);
+    const env: session_mod.Env = .{ .io = io, .gpa = testing.allocator, .environ = &environ, .state_dir = dir };
+    var job = testJob();
+    job.id = "pending";
+    job.owner_key = "account";
+    job.targets = &.{testTarget("/subscriptions/a", "owner", "schedule")};
+    var requests = [_]TrackedRequest{.{ .id = "request", .row = job.targets[0], .attempted = true, .state = .approval }};
+    job.requests = &requests;
+    job.done = true;
+    const saved = try reserve(arena, env, job);
+    saved.lock.close(io);
+    var duplicate = job;
+    duplicate.id = "duplicate";
+    duplicate.intent = .deactivate;
+    try testing.expectError(error.OperationInProgress, reserve(arena, env, duplicate));
+    requests[0].state = .unknown;
+    try store.save(Job, io, saved.dir, saved.file, job);
+    try testing.expectError(error.OperationInProgress, reserve(arena, env, duplicate));
+    requests[0].state = .failed;
+    try store.save(Job, io, saved.dir, saved.file, job);
+    const retry = try reserve(arena, env, duplicate);
+    retry.lock.close(io);
+}
+
+test "history retention keeps unresolved jobs and bounds resolved files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ: std.process.Environ.Map = .init(arena);
+    const env: session_mod.Env = .{ .io = io, .gpa = testing.allocator, .environ = &environ, .state_dir = dir };
+    for (0..retained_history + 3) |i| {
+        var job = testJob();
+        job.id = try std.fmt.allocPrint(arena, "history-{d}", .{i});
+        job.owner_key = "account";
+        job.targets = &.{testTarget("/subscriptions/a", "owner", "schedule")};
+        job.done = true;
+        const reserved = try reserve(arena, env, job);
+        reserved.lock.close(io);
+    }
+    var unknown = testJob();
+    unknown.id = "unresolved";
+    unknown.owner_key = "account";
+    unknown.targets = &.{testTarget("/subscriptions/a", "owner", "schedule")};
+    unknown.done = true;
+    unknown.requests = &.{};
+    unknown.legacy_unresolved = true;
+    const reserved = try reserve(arena, env, unknown);
+    reserved.lock.close(io);
+    _ = try loadAll(arena, env);
+    const after = try loadAll(arena, env);
+    try testing.expectEqual(@as(usize, retained_history + 1), after.len);
+    var found = false;
+    for (after) |job| if (std.mem.eql(u8, job.id, unknown.id)) {
+        found = true;
+        try testing.expect(blocks(job));
+    };
+    try testing.expect(found);
 }

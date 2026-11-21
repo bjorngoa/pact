@@ -30,6 +30,9 @@ pub const Diagnostics = struct {
     status: ?std.http.Status = null,
     code: []const u8 = "",
     message: []const u8 = "",
+    retry_after_seconds: ?u32 = null,
+    retry_after_present: bool = false,
+    claims_challenge: []const u8 = "",
 };
 
 pub const Client = struct {
@@ -85,17 +88,33 @@ pub const Client = struct {
         diag: *Diagnostics,
     ) SubmitError![]const u8 {
         var id: [36]u8 = undefined;
-        try newUuid(io, &id);
+        const request_id = request.request_id orelse blk: {
+            try newUuid(io, &id);
+            break :blk &id;
+        };
 
         var url: std.Io.Writer.Allocating = .init(arena);
         writeUrl(&url.writer, self.base_url, scope, "roleAssignmentScheduleRequests/") catch return error.OutOfMemory;
-        url.writer.print("{s}?api-version=" ++ pim_api_version, .{&id}) catch return error.OutOfMemory;
+        url.writer.print("{s}?api-version=" ++ pim_api_version, .{request_id}) catch return error.OutOfMemory;
 
         var payload: std.Io.Writer.Allocating = .init(arena);
         dto.writeScheduleRequest(&payload.writer, request) catch return error.OutOfMemory;
 
         const body = try self.send(arena, .PUT, url.written(), payload.written(), diag);
         return dto.parseRequestStatus(arena, body);
+    }
+
+    pub fn requestStatus(self: *const Client, arena: std.mem.Allocator, scope: []const u8, id: []const u8, diag: *Diagnostics) Error![]const u8 {
+        var url: std.Io.Writer.Allocating = .init(arena);
+        writeUrl(&url.writer, self.base_url, scope, "roleAssignmentScheduleRequests/") catch return error.OutOfMemory;
+        url.writer.print("{s}?api-version=" ++ pim_api_version, .{id}) catch return error.OutOfMemory;
+        return dto.parseRequestStatus(arena, try self.send(arena, .GET, url.written(), null, diag));
+    }
+
+    pub fn requestId(io: std.Io) std.Io.RandomSecureError![36]u8 {
+        var id: [36]u8 = undefined;
+        try newUuid(io, &id);
+        return id;
     }
 
     fn listAll(
@@ -127,7 +146,18 @@ pub const Client = struct {
         payload: ?[]const u8,
         diag: *Diagnostics,
     ) Error![]const u8 {
-        return deadline.call(self.http.io, request_timeout, sendNow, .{ self, arena, method, url, payload, diag });
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            diag.* = .{};
+            return deadline.call(self.http.io, request_timeout, sendNow, .{ self, arena, method, url, payload, diag }) catch |err| {
+                if (err != error.HttpFailed) return err;
+                const delay = retryDelay(method, diag.*, attempt) orelse return err;
+                var jitter: [1]u8 = undefined;
+                self.http.io.random(&jitter);
+                try self.http.io.sleep(.fromMilliseconds(@as(i64, delay) * 1000 + jitter[0]), .awake);
+                continue;
+            };
+        }
     }
 
     /// Redirects are never followed, so the token cannot leak to another host.
@@ -139,11 +169,7 @@ pub const Client = struct {
         payload: ?[]const u8,
         diag: *Diagnostics,
     ) Error![]const u8 {
-        var body: std.Io.Writer.Allocating = .init(arena);
-        const result = try self.http.fetch(.{
-            .location = .{ .url = url },
-            .method = method,
-            .payload = payload,
+        var req = try self.http.request(method, try std.Uri.parse(url), .{
             .redirect_behavior = .unhandled,
             .headers = .{
                 .authorization = .{ .override = self.authorization },
@@ -151,18 +177,71 @@ pub const Client = struct {
                 .content_type = if (payload != null) .{ .override = "application/json" } else .default,
             },
             .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
-            .response_writer = &body.writer,
         });
-        const bytes = body.written();
-        if (result.status.class() != .success) {
+        defer req.deinit();
+        if (payload) |data| {
+            req.transfer_encoding = .{ .content_length = data.len };
+            var body = try req.sendBodyUnflushed(&.{});
+            try body.writer.writeAll(data);
+            try body.end();
+            try req.connection.?.flush();
+        } else try req.sendBodiless();
+        var response = try req.receiveHead(&.{});
+        const status = response.head.status;
+        var headers = response.head.iterateHeaders();
+        var retry_after: ?u32 = null;
+        var retry_after_present = false;
+        var claims: []const u8 = "";
+        while (headers.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                retry_after_present = true;
+                retry_after = std.fmt.parseInt(u32, header.value, 10) catch null;
+            }
+            if (std.ascii.eqlIgnoreCase(header.name, "www-authenticate"))
+                claims = try arena.dupe(u8, header.value);
+        }
+        var transfer: [4096]u8 = undefined;
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .gzip, .deflate => try arena.alloc(u8, std.compress.flate.max_window_len),
+            .zstd => try arena.alloc(u8, std.compress.zstd.default_window_len),
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        var decompress: std.http.Decompress = undefined;
+        const bytes = response.readerDecompressing(&transfer, &decompress, decompress_buffer).allocRemaining(arena, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+            error.StreamTooLong, error.OutOfMemory => return err,
+        };
+        if (status.class() != .success) {
             const err = dto.parseError(arena, bytes);
-            diag.* = .{ .status = result.status, .code = err.code, .message = err.message };
+            diag.* = .{ .status = status, .code = err.code, .message = err.message, .retry_after_seconds = retry_after, .retry_after_present = retry_after_present, .claims_challenge = claims };
             return error.HttpFailed;
         }
         return bytes;
     }
 };
 
+fn retryDelay(method: std.http.Method, diag: Diagnostics, attempt: u32) ?u32 {
+    if (attempt >= 2) return null;
+    const status = diag.status orelse return null;
+    const retryable = status == .too_many_requests or status == .service_unavailable or
+        (method == .GET and (status == .internal_server_error or status == .bad_gateway or status == .gateway_timeout));
+    if (!retryable) return null;
+    if (diag.retry_after_present and diag.retry_after_seconds == null) return null;
+    // A longer server-directed wait is surfaced to the caller, never shortened.
+    const delay = diag.retry_after_seconds orelse (@as(u32, 1) << @intCast(attempt));
+    return if (delay <= 20) delay else null;
+}
+
+test "throttling honors Retry-After and retries are bounded" {
+    try std.testing.expectEqual(@as(?u32, 7), retryDelay(.PUT, .{ .status = .too_many_requests, .retry_after_seconds = 7 }, 0));
+    try std.testing.expect(retryDelay(.PUT, .{ .status = .too_many_requests, .retry_after_seconds = 60 }, 0) == null);
+    try std.testing.expect(retryDelay(.GET, .{ .status = .too_many_requests }, 2) == null);
+    try std.testing.expect(retryDelay(.PUT, .{ .status = .bad_gateway }, 0) == null);
+    try std.testing.expectEqual(@as(?u32, 1), retryDelay(.GET, .{ .status = .bad_gateway }, 0));
+    try std.testing.expect(retryDelay(.GET, .{ .status = .unauthorized }, 0) == null);
+    try std.testing.expect(retryDelay(.GET, .{ .status = .too_many_requests, .retry_after_present = true }, 0) == null);
+}
 fn pimPath(comptime collection: []const u8) []const u8 {
     return "/providers/Microsoft.Authorization/" ++ collection ++
         "?api-version=" ++ pim_api_version ++ "&$filter=asTarget()";
