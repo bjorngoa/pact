@@ -182,6 +182,7 @@ test {
     _ = @import("adapters/azure_login.zig");
     _ = @import("adapters/snapshot_cache.zig");
     _ = @import("adapters/json_store.zig");
+    _ = @import("adapters/favorites.zig");
     _ = @import("adapters/herdr.zig");
     _ = @import("domain/alerts.zig");
     _ = @import("app/alerts_service.zig");

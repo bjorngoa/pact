@@ -15,6 +15,7 @@ const herdr = @import("../adapters/herdr.zig");
 const messages = @import("../present/messages.zig");
 const errors = @import("../present/errors.zig");
 const background_job = @import("../app/background_job.zig");
+const favorites = @import("../adapters/favorites.zig");
 
 const Row = rows_mod.Row;
 const Diagnostics = session_mod.Diagnostics;
@@ -34,6 +35,7 @@ pub const help_text =
     \\  pick     Interactive picker (default in a terminal; alias: ui).
     \\           Type to filter, tab to select, enter to activate,
     \\           ctrl-d to deactivate, ctrl-r to refresh, esc to quit.
+    \\           ctrl-f toggles a favorite; favorites appear first in pick and ls.
     \\  ls       List eligible roles and their activation state
     \\           (default when output is not a terminal).
     \\  up       Activate eligible roles (alias: activate).
@@ -103,6 +105,11 @@ pub fn list(ctx: Context, opts: args.List, diag: *Diagnostics) Error!void {
     if (reconciled) policy.force = true;
     const result = try service.get(ctx.session, ctx.arena(), ctx.now, policy, diag);
     const all = try rows_mod.build(ctx.arena(), result.snapshot, ctx.now);
+    const favorites_dir = try ctx.session.cacheDir(ctx.arena(), diag);
+    if (favorites.load(ctx.arena(), ctx.session.env.io, favorites_dir)) |saved| {
+        try saved.apply(ctx.arena(), all);
+        rows_mod.sort(all);
+    } else |_| try ctx.stderr.writeAll("pim: could not read favorites; using the default order.\n");
 
     var selected: std.ArrayList(Row) = .empty;
     for (all) |row| if (rows_mod.matches(row, opts.terms)) try selected.append(ctx.arena(), row);

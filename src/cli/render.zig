@@ -22,7 +22,7 @@ pub fn writeTable(arena: std.mem.Allocator, w: *std.Io.Writer, rows: []const row
 
     for (rows, cells) |row, *cell| {
         cell.* = .{
-            stateLabel(row.state),
+            if (row.favorite) try std.fmt.allocPrint(arena, "* {s}", .{stateLabel(row.state)}) else stateLabel(row.state),
             try sanitize(arena, row.eligibility.role_name),
             try sanitize(arena, row.eligibility.scope_name),
             try sanitize(arena, row.subscription_name),
@@ -37,6 +37,7 @@ pub fn writeTable(arena: std.mem.Allocator, w: *std.Io.Writer, rows: []const row
 
 const JsonRow = struct {
     state: rows_mod.State,
+    favorite: bool,
     role: []const u8,
     scope: []const u8,
     scopeName: []const u8,
@@ -50,6 +51,7 @@ pub fn writeJson(arena: std.mem.Allocator, w: *std.Io.Writer, rows: []const rows
     for (rows, out) |row, *dst| {
         dst.* = .{
             .state = row.state,
+            .favorite = row.favorite,
             .role = row.eligibility.role_name,
             .scope = row.eligibility.scope,
             .scopeName = row.eligibility.scope_name,
@@ -158,4 +160,19 @@ test "writeJson emits machine-readable rows" {
     try testing.expectEqualStrings("active", parsed[0].state);
     try testing.expectEqualStrings("1970-01-01T00:02:00Z", parsed[0].expiresAt);
     try testing.expectEqual(@as(i64, 100), parsed[0].expiresInSeconds);
+}
+
+test "favorite marker is visible in table and JSON output" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var row = testRow(.eligible, "rg", null);
+    row.favorite = true;
+    try writeTable(arena, &out.writer, &.{row}, 0, .{});
+    try testing.expect(std.mem.indexOf(u8, out.written(), "* ○ eligible") != null);
+    out.clearRetainingCapacity();
+    try writeJson(arena, &out.writer, &.{row}, 0);
+    const parsed = try std.json.parseFromSliceLeaky([]const struct { favorite: bool }, arena, out.written(), .{ .ignore_unknown_fields = true });
+    try testing.expect(parsed[0].favorite);
 }

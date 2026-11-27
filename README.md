@@ -96,9 +96,12 @@ Run `pim help` for every option.
 | enter | activate the selected roles (or the current one): opens a form for duration and justification |
 | ctrl-d | deactivate the selected or current active roles (asks for confirmation) |
 | ctrl-r | refresh from Azure |
+| ctrl-f | toggle a favorite for the highlighted role |
 | ctrl-w, ctrl-u | delete a word, clear the input |
 | esc | clear the filter, then the selection, then quit (closes the form, or hides the progress window) |
 | ctrl-c | quit |
+
+Favorites are saved per Azure account and marked with a star in the picker (`*` in `pim ls`). They appear first in both lists, preserving the existing ordering within favorites and other roles. Filtering still applies normally. `pim ls --json` includes a `favorite` boolean for each role.
 
 While an activation or deactivation runs, the header shows a spinner. For something easier to notice, opt in with `PIM_PROGRESS_WINDOW=1`: a progress window then shows the roles, a progress bar and the elapsed time, and the affected rows show a spinner. `esc` hides the window while the operation keeps running; enter or ctrl-d brings it back.
 

@@ -30,6 +30,7 @@ pub const Input = union(enum) {
     quit,
     deactivate,
     refresh,
+    toggle_favorite,
     sign_in,
 };
 
@@ -54,6 +55,7 @@ pub const Effect = union(enum) {
     none,
     quit,
     refresh,
+    toggle_favorite: Row,
     sign_in: azure_login.Method,
     cancel_sign_in,
     dismiss_sign_in,
@@ -239,6 +241,11 @@ pub const Model = struct {
         m.notice = .init(kind, text);
     }
 
+    pub fn favoritesChanged(m: *Model) Allocator.Error!void {
+        const keep = if (m.currentRow()) |row| row.eligibility.schedule_id else null;
+        try m.applyFilter(keep);
+    }
+
     pub fn setRefreshFailed(m: *Model, text: []const u8) void {
         m.refreshing = false;
         m.setNotice(.failed, text);
@@ -403,6 +410,7 @@ pub const Model = struct {
                 m.moveBy(-1);
             },
             .enter => return m.beginActivate(),
+            .toggle_favorite => if (m.currentRow()) |row| return .{ .toggle_favorite = row },
             .deactivate => return m.beginDeactivate(),
             .refresh => if (!m.refreshing) {
                 m.refreshing = true;
@@ -647,13 +655,22 @@ pub const Model = struct {
         m.cursor = 0;
         for (m.rows, 0..) |row, i| {
             if (!rows_mod.matches(row, terms.items)) continue;
-            if (keep) |id| if (std.mem.eql(u8, row.eligibility.schedule_id, id)) {
-                m.cursor = m.visible.items.len;
-            };
             try m.visible.append(m.gpa, @intCast(i));
         }
+        std.mem.sort(u32, m.visible.items, m.rows, favoriteFirst);
+        if (keep) |id| for (m.visible.items, 0..) |index, i| {
+            if (std.mem.eql(u8, m.rows[index].eligibility.schedule_id, id)) {
+                m.cursor = i;
+                break;
+            }
+        };
         if (keep == null) m.scroll = 0;
         m.ensureCursorVisible();
+    }
+
+    fn favoriteFirst(rows: []const Row, a: u32, b: u32) bool {
+        if (rows[a].favorite != rows[b].favorite) return rows[a].favorite;
+        return a < b;
     }
 
     fn moveBy(m: *Model, delta: isize) void {
@@ -709,12 +726,50 @@ fn freeEffect(effect: Effect) void {
             testing.allocator.free(job.targets);
             testing.allocator.free(job.justification);
         },
-        .none, .quit, .refresh, .sign_in, .cancel_sign_in, .dismiss_sign_in => {},
+        .none, .quit, .refresh, .toggle_favorite, .sign_in, .cancel_sign_in, .dismiss_sign_in => {},
     }
 }
 
 fn press(m: *Model, input: Input) !Effect {
     return m.update(input);
+}
+
+test "favorite reordering preserves cursor, selections and filtering" {
+    var m: Model = .init(testing.allocator, 480);
+    defer m.deinit();
+    var rows = fixture;
+    try m.setRows(&rows, 0);
+    _ = try press(&m, .tab);
+    const effect = try press(&m, .toggle_favorite);
+    try testing.expectEqualStrings("e2", effect.toggle_favorite.eligibility.schedule_id);
+    m.refreshing = true;
+    rows[1].favorite = true;
+    try m.favoritesChanged();
+    try testing.expect(m.refreshing);
+    try testing.expectEqual(@as(usize, 0), m.cursor);
+    try testing.expectEqualStrings("e2", m.currentRow().?.eligibility.schedule_id);
+    try testing.expect(m.isSelected(rows[0]));
+    _ = try press(&m, .{ .text = "dev" });
+    try testing.expectEqual(@as(usize, 2), m.visible.items.len);
+    try testing.expectEqualStrings("e1", m.currentRow().?.eligibility.schedule_id);
+    _ = try press(&m, .escape);
+    try testing.expectEqualStrings("e2", m.currentRow().?.eligibility.schedule_id);
+    rows[1].favorite = false;
+    try m.favoritesChanged();
+    try testing.expectEqual(@as(usize, 1), m.cursor);
+    try testing.expectEqualStrings("e2", m.currentRow().?.eligibility.schedule_id);
+    try testing.expectEqual(@as(u32, 0), m.visible.items[0]);
+}
+
+test "favorite shortcut does nothing without a current row or while editing a form" {
+    var m: Model = .init(testing.allocator, 480);
+    defer m.deinit();
+    try testing.expectEqual(Effect.none, try press(&m, .toggle_favorite));
+    try m.setRows(&fixture, 0);
+    const effect = try press(&m, .enter);
+    defer freeEffect(effect);
+    try testing.expectEqual(Effect.none, try press(&m, .toggle_favorite));
+    try testing.expectEqual(Mode.form, m.mode);
 }
 
 test "typing filters rows and resets the cursor" {

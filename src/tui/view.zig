@@ -168,6 +168,7 @@ fn drawList(arena: Allocator, win: Window, m: *const Model, now: i64) Allocator.
             _ = print(line, 0, 0, "▌", .{ .fg = accent, .bg = base.bg });
         }
         if (m.isSelected(r)) _ = print(line, 0, 2, "✓", merge(base, style_selected));
+        if (r.favorite) _ = print(line, 0, prefix_width - 1, "★", merge(base, style_selected));
         if (m.isWorking(r)) {
             _ = print(line, 0, 4, spinnerFrame(m), merge(base, style_working));
         } else _ = print(line, 0, 4, stateGlyph(r.state), merge(base, stateStyle(r.state)));
@@ -197,9 +198,9 @@ fn drawFooter(arena: Allocator, win: Window, m: *const Model) Allocator.Error!vo
     }
     const help = switch (m.mode) {
         .browse => if (m.sign_in_enabled)
-            "↑↓ move · tab select · enter activate · ^d deactivate · ^r refresh · ^l sign in · esc quit"
+            "↑↓ move · tab select · ^f favorite · enter activate · ^d deactivate · ^r refresh · ^l sign in · esc quit"
         else
-            "↑↓ move · tab select · enter activate · ^d deactivate · ^r refresh · esc quit",
+            "↑↓ move · tab select · ^f favorite · enter activate · ^d deactivate · ^r refresh · esc quit",
         .form => "enter submit · tab switch field · esc cancel",
         .confirm_deactivate => "y/enter confirm · n/esc cancel",
         .progress => "esc hide (keeps running) · ^c quit",

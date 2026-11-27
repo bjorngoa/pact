@@ -13,6 +13,7 @@ pub const Row = struct {
     state: State,
     /// Set when `state == .active` and the activation is time-bound.
     active_until: ?i64 = null,
+    favorite: bool = false,
 };
 
 /// Builds rows sorted for display. The caller owns the returned slice; strings
@@ -63,6 +64,10 @@ pub fn build(gpa: std.mem.Allocator, snapshot: role.Snapshot, now: i64) std.mem.
     return rows;
 }
 
+pub fn sort(rows: []Row) void {
+    std.mem.sort(Row, rows, {}, lessThan);
+}
+
 /// True when every term occurs (case-insensitively) in the row's scope,
 /// subscription or role name. An empty term list matches everything.
 pub fn matches(row: Row, terms: []const []const u8) bool {
@@ -105,6 +110,7 @@ fn stateRank(s: State) u8 {
 }
 
 fn lessThan(_: void, a: Row, b: Row) bool {
+    if (a.favorite != b.favorite) return a.favorite;
     if (a.state != b.state) return stateRank(a.state) < stateRank(b.state);
     if (a.state == .active) {
         const ae = a.active_until orelse std.math.maxInt(i64);
@@ -219,4 +225,18 @@ test "matches requires every term in some field" {
     try testing.expect(matches(row, &.{ "orders", "contrib" }));
     try testing.expect(matches(row, &.{"contoso"}));
     try testing.expect(!matches(row, &.{ "orders", "owner" }));
+}
+
+test "favorites sort ahead of active rows while preserving normal order within groups" {
+    var rows = [_]Row{
+        .{ .eligibility = elig("/a", "a", "Owner"), .subscription_name = "Sub", .state = .eligible },
+        .{ .eligibility = elig("/b", "b", "Owner"), .subscription_name = "Sub", .state = .active },
+        .{ .eligibility = elig("/c", "c", "Owner"), .subscription_name = "Sub", .state = .eligible, .favorite = true },
+        .{ .eligibility = elig("/d", "d", "Owner"), .subscription_name = "Sub", .state = .active, .favorite = true },
+    };
+    sort(&rows);
+    try testing.expectEqualStrings("d", rows[0].eligibility.scope_name);
+    try testing.expectEqualStrings("c", rows[1].eligibility.scope_name);
+    try testing.expectEqualStrings("b", rows[2].eligibility.scope_name);
+    try testing.expectEqualStrings("a", rows[3].eligibility.scope_name);
 }

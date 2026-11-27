@@ -19,6 +19,7 @@ const log = @import("../platform/log.zig");
 const model_mod = @import("model.zig");
 const keymap = @import("keymap.zig");
 const view = @import("view.zig");
+const favorites = @import("../adapters/favorites.zig");
 
 const Row = rows_mod.Row;
 const Model = model_mod.Model;
@@ -46,7 +47,8 @@ const Event = union(enum) {
 /// Results of one background task, owned by its arena.
 const Batch = struct {
     arena: std.heap.ArenaAllocator,
-    rows: ?[]const Row = null,
+    rows: ?[]Row = null,
+    favorites_dir: ?[]const u8 = null,
     fetched_at: i64 = 0,
     plans: []const activation.Plan = &.{},
     failure: ?[]const u8 = null,
@@ -138,6 +140,8 @@ const App = struct {
             .none => {},
             .quit => return true,
             .refresh => _ = app.spawn(m, refreshTask, .{ app, app.generation }),
+            .toggle_favorite => |row| app.toggleFavorite(m, row) catch
+                m.setNotice(.failed, "Could not save favorites. Check the state directory and Azure account."),
             .load_policies => |targets| if (!app.spawn(m, policiesTask, .{ app, targets, m.default_duration_min, app.generation })) app.gpa.free(targets),
             .sign_in => |method| app.startSignIn(m, method),
             .cancel_sign_in => {
@@ -345,9 +349,29 @@ const App = struct {
     }
 
     fn adoptRows(app: *App, m: *Model, b: *Batch) Allocator.Error!void {
+        var scratch: std.heap.ArenaAllocator = .init(app.gpa);
+        defer scratch.deinit();
+        if (b.favorites_dir) |path| {
+            const saved = favorites.load(scratch.allocator(), app.io, path) catch null;
+            if (saved) |value| {
+                try value.apply(scratch.allocator(), b.rows.?);
+            } else m.setNotice(.failed, "Could not read favorites.");
+        }
         try m.setRows(b.rows.?, b.fetched_at);
         if (app.rows_batch) |old| try app.retire(old);
         app.rows_batch = b;
+    }
+
+    fn toggleFavorite(app: *App, m: *Model, row: Row) !void {
+        const batch = app.rows_batch orelse return;
+        var scratch: std.heap.ArenaAllocator = .init(app.gpa);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        var diag: session_mod.Diagnostics = .{};
+        const dir = try app.session.cacheDir(arena, &diag);
+        const updated = try favorites.toggle(arena, app.io, dir, row);
+        try updated.apply(arena, batch.rows.?);
+        try m.favoritesChanged();
     }
 
     fn retire(app: *App, b: *Batch) Allocator.Error!void {
@@ -410,6 +434,7 @@ fn loadRows(app: *App, b: *Batch, diag: *session_mod.Diagnostics) errors.Error!v
     const now = app.now();
     const snapshot = try service.refresh(app.session, b.allocator(), now, diag);
     b.rows = try rows_mod.build(b.allocator(), snapshot, now);
+    b.favorites_dir = try app.session.cacheDir(b.allocator(), diag);
     b.fetched_at = snapshot.fetched_at;
 }
 
@@ -552,8 +577,51 @@ fn loadCachedRows(app: *App) Allocator.Error!?*Batch {
         return null;
     };
     b.rows = try rows_mod.build(b.allocator(), snapshot, app.now());
+    var diag: session_mod.Diagnostics = .{};
+    b.favorites_dir = app.session.cacheDir(b.allocator(), &diag) catch null;
     b.fetched_at = snapshot.fetched_at;
     return b;
+}
+
+test "adopting refreshed rows reloads the latest persisted favorites" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena);
+    var model: Model = .init(testing.allocator, 480);
+    defer model.deinit();
+    var app: App = .{ .gpa = testing.allocator, .io = testing.io, .session = undefined, .loop = undefined };
+    defer {
+        if (app.rows_batch) |b| b.release(testing.allocator);
+        for (app.retired.items) |b| b.release(testing.allocator);
+        app.retired.deinit(testing.allocator);
+    }
+    const a: Row = .{
+        .eligibility = .{ .schedule_id = "a", .scope = "/a", .scope_name = "a", .role_definition_id = "r", .role_name = "Role" },
+        .subscription_name = "Sub",
+        .state = .active,
+    };
+    var b = a;
+    b.eligibility.schedule_id = "b";
+    b.eligibility.scope = "/b";
+    b.state = .eligible;
+    _ = try favorites.toggle(arena, testing.io, root, b);
+    const first = try Batch.create(testing.allocator);
+    first.rows = try first.allocator().dupe(Row, &.{ a, b });
+    first.favorites_dir = root;
+    try app.adoptRows(&model, first);
+    try testing.expectEqualStrings("b", model.currentRow().?.eligibility.schedule_id);
+    _ = try favorites.toggle(arena, testing.io, root, b);
+    const refreshed = try Batch.create(testing.allocator);
+    refreshed.rows = try refreshed.allocator().dupe(Row, &.{ a, b });
+    refreshed.favorites_dir = root;
+    try app.adoptRows(&model, refreshed);
+    try testing.expect(!model.currentRow().?.favorite);
+    try testing.expectEqualStrings("b", model.currentRow().?.eligibility.schedule_id);
+    try testing.expectEqual(@as(u32, 0), model.visible.items[0]);
 }
 
 test "login refresh replaces roles but stale pre-login results cannot reopen authentication" {
@@ -600,7 +668,7 @@ test "login refresh replaces roles but stale pre-login results cannot reopen aut
     done.generation = 3;
     var active = target;
     active.state = .active;
-    done.rows = &.{active};
+    done.rows = try done.allocator().dupe(Row, &.{active});
     done.fetched_at = 100;
     try app.handle(&model, .{ .login_done = done });
     try testing.expectEqual(model_mod.SignInState.ready, model.sign_in_state);
